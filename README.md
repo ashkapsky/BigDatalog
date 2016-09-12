@@ -1,95 +1,40 @@
-# Apache Spark
+# BigDatalog on Spark 1.6.1 
 
-Spark is a fast and general cluster computing system for Big Data. It provides
-high-level APIs in Scala, Java, Python, and R, and an optimized engine that
-supports general computation graphs for data analysis. It also supports a
-rich set of higher-level tools including Spark SQL for SQL and DataFrames,
-MLlib for machine learning, GraphX for graph processing,
-and Spark Streaming for stream processing.
+BigDatalog is a Datalog system for Big Data Analytics first presented at SIGMOD 2016.  See the paper [Big Data Analytics with Datalog Queries on Spark](http://yellowstone.cs.ucla.edu/~yang/paper/sigmod2016-p958.pdf) for details.
 
-<http://spark.apache.org/>
+BigDatalog is implemented as a module (datalog) in Spark that requires a few changes to the core and sql modules.  Building, configuring and running examples follows the normal Spark approach which you can read about under [here] (http://spark.apache.org/docs/1.6.1/). 
 
+## Building BigDatalog
+Building and running BigDatalog follows the same procedures as Spark itself.  See ["Building Spark"](http://spark.apache.org/docs/1.6.1/building-spark.html).
 
-## Online Documentation
+## Running Tests
+Once you have a successful build, verify BigDatalog by running its test cases (using sbt):
 
-You can find the latest Spark documentation, including a programming
-guide, on the [project web page](http://spark.apache.org/documentation.html)
-and [project wiki](https://cwiki.apache.org/confluence/display/SPARK).
-This README file only contains basic setup instructions.
-
-## Building Spark
-
-Spark is built using [Apache Maven](http://maven.apache.org/).
-To build Spark and its example programs, run:
-
-    build/mvn -DskipTests clean package
-
-(You do not need to do this if you downloaded a pre-built package.)
-More detailed documentation is available from the project site, at
-["Building Spark"](http://spark.apache.org/docs/latest/building-spark.html).
-
-## Interactive Scala Shell
-
-The easiest way to start using Spark is through the Scala shell:
-
-    ./bin/spark-shell
-
-Try the following command, which should return 1000:
-
-    scala> sc.parallelize(1 to 1000).count()
-
-## Interactive Python Shell
-
-Alternatively, if you prefer Python, you can use the Python shell:
-
-    ./bin/pyspark
-
-And run the following command, which should also return 1000:
-
-    >>> sc.parallelize(range(1000)).count()
+    >test-only edu.ucla.cs.wis.bigdatalog.spark*
 
 ## Example Programs
 
-Spark also comes with several sample programs in the `examples` directory.
-To run one of them, use `./bin/run-example <class> [params]`. For example:
+BigDatalog comes with several sample programs in the `examples/datalog` directory.  These are run the same as other Spark example programs (i.e., via spark-submit).
 
-    ./bin/run-example SparkPi
-
-will run the Pi example locally.
-
-You can set the MASTER environment variable when running examples to submit
-examples to a cluster. This can be a mesos:// or spark:// URL,
-"yarn" to run on YARN, and "local" to run
-locally with one thread, or "local[N]" to run locally with N threads. You
-can also use an abbreviated class name if the class is in the `examples`
-package. For instance:
-
-    MASTER=spark://host:7077 ./bin/run-example SparkPi
-
-Many of the example programs print usage help if no params are given.
-
-## Running Tests
-
-Testing first requires [building Spark](#building-spark). Once Spark is built, tests
-can be run using:
-
-    ./dev/run-tests
-
-Please see the guidance on how to
-[run tests for a module, or individual tests](https://cwiki.apache.org/confluence/display/SPARK/Useful+Developer+Tools).
-
-## A Note About Hadoop Versions
-
-Spark uses the Hadoop core library to talk to HDFS and other Hadoop-supported
-storage systems. Because the protocols have changed in different versions of
-Hadoop, you must build Spark against the same version that your cluster runs.
-
-Please refer to the build documentation at
-["Specifying the Hadoop Version"](http://spark.apache.org/docs/latest/building-spark.html#specifying-the-hadoop-version)
-for detailed guidance on building for a particular distribution of Hadoop, including
-building for particular Hive and Hive Thriftserver distributions.
+## Writing BigDatalog Programs
+You will want to examine the example BigDatalog programs and the test cases to see how to use the BigDatalogAPI (BigDatalogContext) and how write BigDatalog programs.  For Datalog language help, see the [DeAL tutorial](http://wis.cs.ucla.edu/deals/tutorial/).   
 
 ## Configuration
 
-Please refer to the [Configuration Guide](http://spark.apache.org/docs/latest/configuration.html)
-in the online documentation for an overview on how to configure Spark.
+BigDatalog includes a variety of configuration options in addition to the [Spark Configuration options](http://spark.apache.org/docs/1.6.1/configuration.html).
+
+Property Name | Default | Meaning
+------------- | -------------| -------------
+spark.datalog.recursion.version|3|1 = Multi Job PSN, 2 = Multi Job PSN w/ SetRDD, 3 = Single Job PSN w/ SetRDD
+spark.datalog.aggregaterecursion.version|3|1 = Multi Job PSN, 2 = Multi Job PSN w/ SetRDD, 3 = Single Job PSN w/ SetRDD
+spark.datalog.recursion.memorycheckpoint|true|Each iteration of recursion, cache the RDDs in memory and clear the lineage.  Avoids a stack-overflow from long lineages and greatly reduces closurecleaning time but you better have enough memory. Use false if the program+dataset requires few iterations. 
+spark.datalog.recursion.iterateinfixedpointresulttask|false|Decomposable predicates will not require shuffling during recursion.  This flag allows the FixedPointResultTask to iterate rather than perform a single iteration. 
+spark.datalog.storage.level|MEMORY_ONLY|Default StorageLevel for recursive predicate RDD caching.
+spark.datalog.shuffledistinct.enabled|false|Enables a "map-side distinct" before a shuffle to reduce the amount of data produced during a join in a recursion.
+spark.datalog.jointype|broadcast|"broadcast" (or no setting at all) - the plan generator will attempt to insert BroadcastHints into the plan to produce a BroadcastJoin.  "shuffle" - the plan generator will attempt to insert CacheHints to cache the build side of a ShuffleHashJoin.  "sortmerge" - the plan generator will attempt no hints and produce a SortMergeJoin.  With "broadcast" or "shuffle", if no hints are given, SortMergeJoin is produced. 
+spark.datalog.uniondistinct.enabled|true|Deduplicate union operations.  Datalog uses set-semantics.
+
+*PSN = Parallel Semi-naive Evaluation
+
+### Configuring BigDatalog Programs
+Many BigDatalog programs will perform better given more memory.  Make sure to choose a 'good' setting for spark.executor.memory and consider increasing spark.memory.fraction and spark.memory.storageFraction, especially for programs that require little-to-no shuffling.
