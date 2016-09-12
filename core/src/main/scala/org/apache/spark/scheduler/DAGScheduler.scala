@@ -33,7 +33,7 @@ import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
-import org.apache.spark.rdd.{LocalCheckpointRDD, LocalRDDCheckpointData, MemoryRDDCheckpointData, RDD}
+import org.apache.spark.rdd.{MemoryRDDCheckpointData, RDD}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.scheduler.fixedpoint.{FixedPointJobDefinition, FixedPointJobListener, FixedPointResultStage, FixedPointResultTask}
 import org.apache.spark.storage._
@@ -936,16 +936,15 @@ class DAGScheduler(
     if (nextIterationResultStage != null) {
       clearCacheLocs()
       job.finalStage = nextIterationResultStage
-      //job.func = fpjd.getfixedPointEvaluator
+
       job.numFinished = 0
       for (i <- 0 until job.numPartitions)
         job.finished(i) = false
 
       nextIterationResultStage.setActiveJob(job)
 
-      val stageIds = nextIterationResultStage.parents.map(_.id) ++ Seq(nextIterationResultStage.id)
-      val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
-
+      //val stageIds = nextIterationResultStage.parents.map(_.id) ++ Seq(nextIterationResultStage.id)
+      //val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
       //listenerBus.post(SparkListenerJobIterationStart(job.jobId, clock.getTimeMillis(), stageInfos))
 
       submitStage(nextIterationResultStage)
@@ -1124,7 +1123,7 @@ class DAGScheduler(
           partitionsToCompute.map { id =>
             val p: Int = stage.partitions(id)
             val part = stage.rdd.partitions(p)
-            val locs = getPreferredLocs(stage.rdd, p)
+            val locs = taskIdToLocations(id)
             new FixedPointResultTask(stage.id, stage.latestInfo.attemptId,
               taskBinary, part, locs, id, stage.internalAccumulators, stage.hasParent, fpjd.rddIds)
           }

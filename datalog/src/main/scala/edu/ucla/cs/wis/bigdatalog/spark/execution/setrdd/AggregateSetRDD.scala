@@ -182,7 +182,7 @@ object AggregateSetRDD extends Logging {
         output.asInstanceOf[RDD[AggregateSetRDDPartition]]
       }
       case _ => {
-        throw new Exception();
+        throw new Exception()
       }
     }
 

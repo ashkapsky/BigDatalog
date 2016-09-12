@@ -24,7 +24,6 @@ class FixedPointJobListener(dagScheduler: DAGScheduler,
                             numPartitions: Int,
                             val fixedPointJobDefinition: FixedPointJobDefinition) extends JobListener {
 
-  var taskStatuses = Array.fill[Byte](numPartitions)(-1)
   var emptyPartitions: Int = 0
   var isFixedPointReached = false
   var jobResult : Option[JobResult] = None
@@ -33,24 +32,11 @@ class FixedPointJobListener(dagScheduler: DAGScheduler,
     dagScheduler.cancelJob(jobId)
   }
 
-  def markTaskStatus(index: Int, result: Byte) = {
-    // only change if not already set
-    if (taskStatuses(index) == -1) {
-      taskStatuses(index) = result
-      if (result == 0)
-        emptyPartitions += 1
-    }
-  }
-
   override def taskSucceeded(index: Int, result: Any): Unit = synchronized {
     if (result.isInstanceOf[Long]) {
       val count = result.asInstanceOf[Long]
-      if (count == 0) {
+      if (count == 0)
         emptyPartitions += 1
-        taskStatuses(index) = 0
-      } else {
-        taskStatuses(index) = 1
-      }
 
       // if null we only want one iteration
       if (fixedPointJobDefinition == null) {
@@ -61,12 +47,8 @@ class FixedPointJobListener(dagScheduler: DAGScheduler,
         //this.notifyAll()
       }
     } else if (result.isInstanceOf[Boolean]) { // true means the deltaS for the partition is not empty
-      if (!result.asInstanceOf[Boolean]) {
+      if (!result.asInstanceOf[Boolean])
         emptyPartitions += 1
-        taskStatuses(index) = 0
-      } else {
-        taskStatuses(index) = 1
-      }
 
       // if null we only want one iteration
       if (fixedPointJobDefinition == null) {
@@ -81,7 +63,6 @@ class FixedPointJobListener(dagScheduler: DAGScheduler,
 
   def reset() = {
     emptyPartitions = 0
-    taskStatuses = Array.fill[Byte](numPartitions)(-1)
     jobResult.synchronized {
       jobResult = None
     }

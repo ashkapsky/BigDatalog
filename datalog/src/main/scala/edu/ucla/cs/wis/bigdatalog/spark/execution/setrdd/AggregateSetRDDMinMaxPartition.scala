@@ -43,11 +43,12 @@ class AggregateSetRDDMinMaxPartition(aggregateStore: UnsafeFixedWidthMonotonicAg
              monotonicAggregate: MonotonicAggregate): (AggregateSetRDDPartition, SetRDDPartition[InternalRow]) = {//Iterator[InternalRow]) = {
 
     val start = System.currentTimeMillis()
+    val before = aggregateStore.numElements()
     // this is going to perform the aggregation and return an iterator over the output
     val maIter = monotonicAggregate.getAggregationIterator(iter, aggregateStore)
 
-    logInfo("Update deltaSPrime set size %s, aggregate store size %s took %s ms"
-      .format(maIter.deltaSet.size, aggregateStore.numElements(), System.currentTimeMillis() - start))
+    logInfo("Update deltaSPrime set size before %s after %s, delta set size %s took %s ms"
+      .format(before, aggregateStore.numElements(), maIter.deltaSet.size, System.currentTimeMillis() - start))
 
     val hashMapIter = new JavaHashMapIterator(maIter.deltaSet, monotonicAggregate.generateResultProjection())
 

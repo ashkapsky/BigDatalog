@@ -31,9 +31,6 @@ class FixedPointResultStage(id: Int,
                             callSite: CallSite)
   extends ResultStage(id, rdd, func, partitions, parents, jobId, callSite) {
 
-  val finished = Array.fill[Boolean](numPartitions)(false)
-  var numFinished = 0
-
   def hasParent = parents.nonEmpty
 
   override def toString: String = "FixedPointResultStage " + id
