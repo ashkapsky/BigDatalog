@@ -76,7 +76,7 @@ case class MutualRecursion(name : String,
   var exitRulesCompleted = (left == null)
   var all: SetRDD = null
   var deltaS: RDD[InternalRow] = null
-  val version = bigDatalogContext.sparkContext.getConf.getInt("spark.datalog.recursion.version", 4)
+  val version = bigDatalogContext.sparkContext.getConf.getInt("spark.datalog.recursion.version", 3)
 
   def doExecute(): RDD[InternalRow] = {
     if (!exitRulesCompleted) doExit()
