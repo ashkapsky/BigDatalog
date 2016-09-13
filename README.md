@@ -10,7 +10,7 @@ Building and running BigDatalog follows the same procedures as Spark itself.  Se
 ## Running Tests
 Once you have a successful build, verify BigDatalog by running its test cases (using sbt):
 
-    >test-only edu.ucla.cs.wis.bigdatalog.spark*
+    > test-only edu.ucla.cs.wis.bigdatalog.spark*
 
 ## Example Programs
 
@@ -28,7 +28,7 @@ The following are the BigDatalog configuration options:
 Property Name | Default | Meaning
 ------------- | -------------| -------------
 spark.datalog.storage.level|MEMORY_ONLY|Default StorageLevel for recursive predicate RDD caching.
-spark.datalog.jointype|broadcast|"broadcast" (or no setting at all) - the plan generator will attempt to insert BroadcastHints into the plan to produce a BroadcastJoin.  "shuffle" - the plan generator will attempt to insert CacheHints to cache the build side of a ShuffleHashJoin.  "sortmerge" - the plan generator will not attempt any hints and produce a SortMergeJoin.  With "broadcast" or "shuffle", if no hints are given, SortMergeJoin is produced.
+spark.datalog.jointype|broadcast|Default join type.  "broadcast" (or no setting at all) - the plan generator will attempt to insert BroadcastHints into the plan to produce a BroadcastJoin.  "shuffle" - the plan generator will attempt to insert CacheHints to cache the build side of a ShuffleHashJoin.  "sortmerge" - the plan generator will not attempt any hints and produce a SortMergeJoin.  With "broadcast" or "shuffle", if no hints are given, SortMergeJoin is produced.
 spark.datalog.recursion.version|3|1 = Multi Job PSN, 2 = Multi Job PSN w/ SetRDD, 3 = Single Job PSN w/ SetRDD
 spark.datalog.recursion.memorycheckpoint|true|Each iteration of recursion, cache the RDDs in memory and clear lineage.  Avoids a stack-overflow from long lineages and greatly reduces closurecleaning time but you better have enough memory. Use false if the program+dataset requires few iterations. 
 spark.datalog.recursion.iterateinfixedpointresulttask|false|Decomposable predicates will not require shuffling during recursion.  This flag allows the FixedPointResultTask to iterate rather than perform a single iteration. 
