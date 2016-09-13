@@ -20,7 +20,7 @@ package edu.ucla.cs.wis.bigdatalog.spark
 import edu.ucla.cs.wis.bigdatalog.spark.execution.ShuffleHashJoin
 import edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates.{MonotonicAggregate, MonotonicAggregatePartial}
 import edu.ucla.cs.wis.bigdatalog.spark.logical.CacheHint
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, Final, Partial}
+import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Expression, NamedExpression}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.Inner
@@ -119,16 +119,50 @@ class BigDatalogPlanner(val bigDatalogContext: BigDatalogContext)
           }.asInstanceOf[NamedExpression]
         }
 
-        planMonotonicAggregate(
-          namedGroupingExpressions.map(_._2),
-          aggregateExpressions,
-          aggregateFunctionToAttribute,
-          rewrittenResultExpressions,
-          partitioning,
-          planLater(child))
+        if (bigDatalogContext.getConf.getBoolean("spark.datalog.monotonicaggregate.usepartial", true)) {
+          planMonotonicAggregate(
+            namedGroupingExpressions.map(_._2),
+            aggregateExpressions,
+            aggregateFunctionToAttribute,
+            rewrittenResultExpressions,
+            partitioning,
+            planLater(child))
+        } else {
+          planMonotonicAggregateWithoutPartial(
+            namedGroupingExpressions.map(_._2),
+            aggregateExpressions,
+            aggregateFunctionToAttribute,
+            rewrittenResultExpressions,
+            partitioning,
+            planLater(child))
+        }
       }
       case _ => Nil
     }
+  }
+
+  def planMonotonicAggregateWithoutPartial(groupingExpressions: Seq[NamedExpression],
+                                           aggregateExpressions: Seq[AggregateExpression],
+                                           aggregateFunctionToAttribute: Map[(AggregateFunction, Boolean), Attribute],
+                                           resultExpressions: Seq[NamedExpression],
+                                           partitioning: Seq[Int],
+                                           child: SparkPlan): Seq[SparkPlan] = {
+    val completeAggregateExpressions = aggregateExpressions.map(_.copy(mode = Complete))
+    val completeAggregateAttributes = completeAggregateExpressions.map {
+      expr => aggregateFunctionToAttribute(expr.aggregateFunction, expr.isDistinct)
+    }
+
+    new MonotonicAggregate(requiredChildDistributionExpressions = Some(groupingExpressions),
+      groupingExpressions = groupingExpressions,
+      nonCompleteAggregateExpressions = Nil,
+      nonCompleteAggregateAttributes = Nil,
+      completeAggregateExpressions = completeAggregateExpressions,
+      completeAggregateAttributes = completeAggregateAttributes,
+      initialInputBufferOffset = 0,
+      resultExpressions = resultExpressions,
+      partitioning = partitioning,
+      child = child
+    ) :: Nil
   }
 
   def planMonotonicAggregate(groupingExpressions: Seq[NamedExpression],
