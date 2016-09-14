@@ -44,11 +44,9 @@ object Experiments {
     val filePath: String = options("file")
 
     val programName = options("program").toInt match {
-      case 10 =>  "Spark-semi-naive-TC"
       case 11 => "BigDatalog-TC-LL"
       case 12 => "BigDatalog-TC-RL"
       case 13 => "BigDatalog-TC-NL"
-      case 20 => "Spark-semi-naive-SG"
       case 21 => "BigDatalog-SG"
       case 31 => "BigDatalog-APSP"
       case 32 => "BigDatalog-SSSP"
@@ -85,82 +83,72 @@ object Experiments {
 
     val programId = options("program").toInt
 
-    // program 10,20 are Spark api programs
-    // all others are BigDatalog programs
-    if (programId == 10) {
-      val result = TC.semi_naive(getGraph(sc, filePath, numpartitions), numpartitions)
-      println("tc size: " + result.count() + ", execution time: " + (System.currentTimeMillis() - start) + " ms")
-    } else if (programId == 20) {
-      val result = SG.sparkSGSemiNaive(sc, getGraph(sc, filePath, numpartitions))
-      println("sg size: " + result.count() + ", execution time: " + (System.currentTimeMillis() - start) + " ms")
-    } else {
-      val bigDatalogCtx = new BigDatalogContext(sc)
-      options.foreach(opt => bigDatalogCtx.getConf.set(opt._1, opt._2))
+    val bigDatalogCtx = new BigDatalogContext(sc)
+    options.foreach(opt => bigDatalogCtx.getConf.set(opt._1, opt._2))
 
-      programId match {
-        case 11 => {
-          val result = runBigDatalogTC(bigDatalogCtx, filePath, options, "LL")
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, tc size: " + result.count())
-        }
-        case 12 => {
-          val result = runBigDatalogTC(bigDatalogCtx, filePath, options, "RL")
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, tc size: " + result.count())
-        }
-        case 13 => {
-          val result = runBigDatalogTC(bigDatalogCtx, filePath, options, "NL")
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, tc size: " + result.count())
-        }
-        case 21 => {
-          val result = runBigDatalogSG(bigDatalogCtx, filePath, options)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, sg size: " + result.count())
-        }
-        case 31 => {
-          val result = runBigDatalogAPSP(bigDatalogCtx, filePath, options)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, apsp size: " + result.count())
-        }
-        case 32 => {
-          val startvertex = options("startvertex").toInt
-          val result = runBigDatalogSSSP(bigDatalogCtx, filePath, options, startvertex)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, sssp size: " + result.count())
-        }
-        case 41 => {
-          val result = runBigDatalogCC(bigDatalogCtx, filePath, options)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, cc size: " + result.collect()(0).get(0))
-        }
-        case 51 => {
-          val startvertex = options("startvertex").toInt
-          val result = runBigDatalogReach(bigDatalogCtx, filePath, options, startvertex)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, reach size: " + result.count())
-        }
-        /*case 61 => {
-          val organizerFilePath = options("organizerFile")
-          val filePaths = filePath :: organizerFilePath :: Nil
-          val result = runDeALAttend(sc, filePaths, options)
-          println("attend size: " + result.count() + " " + (System.currentTimeMillis() - start) + " ms")
-        }*/
-        case 71 => {
-          val result = runBigDatalogTriangleCount(bigDatalogCtx, filePath, options)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, triangle count : " + result)
-        }
-        case 72 => {
-          val result = runBigDatalogTriangleClosing(bigDatalogCtx, filePath, options)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, triangle closing size : " + result.count())
-        }
-        case 73 => {
-          val pagesFilePath = options("pagesfile")
-          val vertexId = options("vertex")
-          val result = runBigDatalogTriangleClosing2(bigDatalogCtx, filePath, pagesFilePath, options, vertexId.toInt)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, triangle closing size : " + result.count())
-        }
-        case 99 => {
-          // example input:
-          // program=99 file=test.deal queryform=prg(A) baserelation_name1=arc.txt baserelation_name2=name2.txt generator=1
-          val inputFilePath = options("file")
-          val queryForm = options("queryform")
-          val baseRelationFilePaths = options.filter(p => p._1.startsWith("baserelation_")).map(x => (x._1.substring(x._1.indexOf("_") + 1), x._2))
-          val result = runAdHoc(bigDatalogCtx, inputFilePath, queryForm, baseRelationFilePaths, options)
-          println("execution time: " + (System.currentTimeMillis() - start) + " ms, " + options("queryform") + " size: " + result.count())
-        }
+    programId match {
+      case 11 => {
+        val result = runBigDatalogTC(bigDatalogCtx, filePath, options, "LL")
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, tc size: " + result.count())
+      }
+      case 12 => {
+        val result = runBigDatalogTC(bigDatalogCtx, filePath, options, "RL")
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, tc size: " + result.count())
+      }
+      case 13 => {
+        val result = runBigDatalogTC(bigDatalogCtx, filePath, options, "NL")
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, tc size: " + result.count())
+      }
+      case 21 => {
+        val result = runBigDatalogSG(bigDatalogCtx, filePath, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, sg size: " + result.count())
+      }
+      case 31 => {
+        val result = runBigDatalogAPSP(bigDatalogCtx, filePath, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, apsp size: " + result.count())
+      }
+      case 32 => {
+        val startvertex = options("startvertex").toInt
+        val result = runBigDatalogSSSP(bigDatalogCtx, filePath, options, startvertex)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, sssp size: " + result.count())
+      }
+      case 41 => {
+        val result = runBigDatalogCC(bigDatalogCtx, filePath, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, cc size: " + result.collect()(0).get(0))
+      }
+      case 51 => {
+        val startvertex = options("startvertex").toInt
+        val result = runBigDatalogReach(bigDatalogCtx, filePath, options, startvertex)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, reach size: " + result.count())
+      }
+      /*case 61 => {
+        val organizerFilePath = options("organizerFile")
+        val filePaths = filePath :: organizerFilePath :: Nil
+        val result = runBigDatalogAttend(bigDatalogCtx, filePaths, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, attend size: " + result.count())
+      }*/
+      case 71 => {
+        val result = runBigDatalogTriangleCount(bigDatalogCtx, filePath, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, triangle count : " + result)
+      }
+      case 72 => {
+        val result = runBigDatalogTriangleClosing(bigDatalogCtx, filePath, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, triangle closing size : " + result.count())
+      }
+      case 73 => {
+        val pagesFilePath = options("pagesfile")
+        val vertexId = options("vertex")
+        val result = runBigDatalogTriangleClosing2(bigDatalogCtx, filePath, pagesFilePath, options, vertexId.toInt)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, triangle closing size : " + result.count())
+      }
+      case 99 => {
+        // example input:
+        // program=99 file=test.deal queryform=prg(A) baserelation_name1=arc.txt baserelation_name2=name2.txt generator=1
+        val inputFilePath = options("file")
+        val queryForm = options("queryform")
+        val baseRelationFilePaths = options.filter(p => p._1.startsWith("baserelation_")).map(x => (x._1.substring(x._1.indexOf("_") + 1), x._2))
+        val result = runAdHoc(bigDatalogCtx, inputFilePath, queryForm, baseRelationFilePaths, options)
+        println("execution time: " + (System.currentTimeMillis() - start) + " ms, " + options("queryform") + " size: " + result.count())
       }
     }
 
@@ -257,7 +245,7 @@ object Experiments {
     runBigDatalogProgram(bigDatalogCtx, database, rules, "reach(A).", Seq(("arc", filePath)))
   }
 
-  def runBigDatalogAttend(bigDatalogCtx: BigDatalogContext, filePaths: Seq[String], options: Map[String, String]): RDD[Row] = {
+  /*def runBigDatalogAttend(bigDatalogCtx: BigDatalogContext, filePaths: Seq[String], options: Map[String, String]): RDD[Row] = {
     val database = "database({organizer(Organizer: integer), arc(From: integer, To: integer)})."
 
     val rules = "cntfriends(Y, mcount<X>) <- attend(X), arc(Y,X)." +
@@ -265,7 +253,7 @@ object Experiments {
       "attend(Y) <- cntfriends(Y, N), N >= 3."
 
     runBigDatalogProgram(bigDatalogCtx, database, rules, "attend(A).", Seq(("organizer", filePaths(0)), ("arc", filePaths(1))))
-  }
+  }*/
 
   def runBigDatalogTriangleCount(bigDatalogCtx: BigDatalogContext, filePath: String, options: Map[String, String]): Long = {
     val rules = "triangles(X,Y,Z) <- arc(X,Y),X < Y, arc(Y,Z), Y < Z, arc(Z,X)." +
