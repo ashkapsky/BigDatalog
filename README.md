@@ -5,7 +5,9 @@ BigDatalog is a Datalog system for Big Data Analytics first presented at SIGMOD 
 BigDatalog is implemented as a module (datalog) in Spark that requires a few changes to the core and sql modules.  Building, configuring and running examples follows the normal Spark approach which you can read about under [here] (http://spark.apache.org/docs/1.6.1/). 
 
 ## Building BigDatalog
-Building and running BigDatalog follows the same procedures as Spark itself.  See ["Building Spark"](http://spark.apache.org/docs/1.6.1/building-spark.html).
+Building and running BigDatalog follows the same procedures as Spark itself (see ["Building Spark"](http://spark.apache.org/docs/1.6.1/building-spark.html)) with one exception.  Before building for the first time, run the following to install the front-end compiler into the maven's local repository:
+
+    $ build/mvn install:install-file -Dfile=datalog/lib/DeALS-0.6.jar -DgroupId=DeALS -DartifactId=DeALS -Dversion=0.6 -Dpackaging=jar
 
 ## Running Tests
 Once you have a successful build, verify BigDatalog by running its test cases (using sbt):
