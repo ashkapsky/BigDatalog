@@ -9,10 +9,7 @@ Building and running BigDatalog follows the same procedures as Spark itself (see
 
     $ build/mvn install:install-file -Dfile=datalog/lib/DeALS-0.6.jar -DgroupId=DeALS -DartifactId=DeALS -Dversion=0.6 -Dpackaging=jar
 
-## Running Tests
-Once you have a successful build, verify BigDatalog by running its test cases (using sbt):
-
-    > test-only edu.ucla.cs.wis.bigdatalog.spark*
+Once you have a successful build, you can verify BigDatalog by running its test cases (see ["Building Spark"](http://spark.apache.org/docs/1.6.1/building-spark.html)).
 
 ## Example Programs
 
