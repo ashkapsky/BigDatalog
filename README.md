@@ -38,6 +38,6 @@ spark.datalog.uniondistinct.enabled|true|Deduplicate union operations.  Datalog 
 *PSN = Parallel Semi-naive Evaluation
 
 ### Configuring BigDatalog Programs
-To set the number of partitions for a recursive predicate, set spark.sql.shuffle.partitions.  For programs WITHOUT shuffling (decomposable) setting spark.sql.shuffle.partitions = [# of total CPU cores in the cluster] is usually a good choice.  For programs WITH shuffling, this value can vary depending on the program + workload combination, but 1, 2, or 4 X [# of total CPU cores in the cluster] are good values to try.
+To set the number of partitions for a recursive predicate, set spark.sql.shuffle.partitions.  For programs without shuffling in recursion (decomposable programs) setting spark.sql.shuffle.partitions = [# of total CPU cores in the cluster] is usually a good choice.  For programs with shuffling, the value to use for spark.sql.shuffle.partitions can vary depending on the program + workload combination, but 1, 2, or 4 X [# of total CPU cores in the cluster] are good values to try.
 
 Many BigDatalog programs will perform better given more memory.  Make sure to choose a 'good' setting for spark.executor.memory and consider increasing spark.memory.fraction and spark.memory.storageFraction, especially for programs that require little-to-no shuffling.
