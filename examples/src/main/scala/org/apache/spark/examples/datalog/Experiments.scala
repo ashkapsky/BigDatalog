@@ -17,6 +17,7 @@
 
 package org.apache.spark.examples.datalog
 
+import java.nio.charset.Charset
 import java.nio.file.{Files, Paths}
 
 import org.apache.spark.rdd.RDD
@@ -293,7 +294,7 @@ object Experiments {
                baseRelationFilePaths: Map[String, String],
                options: Map[String, String]): RDD[Row] = {
     val rawProgram = new StringBuilder
-    Files.readAllLines(Paths.get(filePath))
+    Files.readAllLines(Paths.get(filePath), Charset.forName("UTF-8"))
       .toArray()
       .foreach(line => rawProgram.append(line))
 
