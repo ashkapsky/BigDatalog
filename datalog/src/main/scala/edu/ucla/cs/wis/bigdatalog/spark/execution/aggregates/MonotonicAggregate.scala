@@ -17,7 +17,9 @@
 
 package edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates
 
-import edu.ucla.cs.wis.bigdatalog.spark.storage.map.UnsafeFixedWidthMonotonicAggregationMap
+import edu.ucla.cs.wis.bigdatalog.spark.SchemaInfo
+import edu.ucla.cs.wis.bigdatalog.spark.execution.setrdd.{SetRDD, SetRDDHashSetPartition}
+import edu.ucla.cs.wis.bigdatalog.spark.storage.map.UnsafeFixedWidthMinMaxMonotonicAggregationMap
 import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -26,6 +28,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateFunction, D
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.expressions.{Attribute, BindReferences, Expression, JoinedRow, NamedExpression, SpecificMutableRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, _}
+import org.apache.spark.sql.execution.metric.LongSQLMetric
 import org.apache.spark.sql.execution.{Exchange, SparkPlan}
 import org.apache.spark.sql.types.StructType
 
@@ -61,7 +64,6 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
       if (partitioning == Nil) {
         ClusteredDistribution(groupingExpressions) :: Nil
       } else {
-        //val expressions = output.zipWithIndex.filter(x => partitioning(x._2) == 1).map(x => x._1)
         ClusteredDistribution(partitioning.zip(output).filter(_._1 == 1).map(_._2)) :: Nil
       }
     }
@@ -74,6 +76,10 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
 
   def isMax = (nonCompleteAggregateExpressions ++ completeAggregateExpressions).forall(_.aggregateFunction.isInstanceOf[MMax])
 
+  def isSum = (nonCompleteAggregateExpressions ++ completeAggregateExpressions).forall(_.aggregateFunction.isInstanceOf[MSum])
+
+  val aggregateResultSchema = nonCompleteAggregateAttributes ++ completeAggregateAttributes
+
   override def outputPartitioning: Partitioning  = {
     val numPartitions = bigDatalogContext.conf.numShufflePartitions
     if (partitioning == Nil) {
@@ -83,8 +89,56 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
     }
   }
 
-  def execute(_allRDD: AggregateSetRDD, _cachingFun: (RDD[_] => Unit)): RDD[InternalRow] = {
-    allRDD = _allRDD
+  def execute(_allRDD: AggregateSetRDD, _cachingFun: (RDD[_] => Unit), relationName: String): RDD[InternalRow] = {
+    allRDD =_allRDD match {
+      case null => null
+      case _ => {
+        // we need to convert the AggregateSetRDD to have partitions amenable to sum
+        // this should only be done once during the switch from max (exit rule) to msum (recursive rule)
+        if (isSum && !_allRDD.monotonicAggregate.isSum) {
+          val newAllRDDPartitions = _allRDD.partitionsRDD.asInstanceOf[RDD[AggregateSetRDDPartition]]
+            .mapPartitionsInternal(part => {
+              part.next().iterator
+            }, true)
+
+          val newAllRDD = AggregateSetRDD(newAllRDDPartitions, schema, this)
+
+          logInfo("Converted AggregateSetRDD from MMin/MMax to MSum")
+
+          bigDatalogContext.setRecursiveRDD("all_" + relationName, newAllRDD)
+
+          val groupingKeySchema = StructType.fromAttributes(groupingExpressions.map(_.toAttribute))
+          val bufferSchema = StructType.fromAttributes(aggregateBufferAttributes.map(_.toAttribute))
+          val fullSchema = StructType.fromAttributes((groupingExpressions ++ aggregateBufferAttributes).map(_.toAttribute))
+
+          //log.info(s"paring down keys of deltaSet from ${groupingExpressions.mkString(",")} to ${distinctGroupingExpressions.mkString(",")}")
+          // remove the subgrouping expressions from rows in the maps in the partitions
+          val schemaInfo = new SchemaInfo(fullSchema, Array.fill(fullSchema.length)(1))
+          val deltaRDD = new SetRDD(_allRDD.partitionsRDD.asInstanceOf[RDD[AggregateSetRDDPartition]].map(part => {
+            // pare down the keys from the deltaSet to produce a newDeltaSet
+            val unsafeRowJoiner = GenerateUnsafeRowJoiner.create(groupingKeySchema, bufferSchema)
+            def generateRowProjection(): (UnsafeRow, UnsafeRow) => UnsafeRow = {
+              (currentGroupingKey: UnsafeRow, currentBuffer: UnsafeRow) => {
+                val joined = unsafeRowJoiner.join(currentGroupingKey, currentBuffer)
+                //logInfo(s"joined: ${Utils.printRow(joined, groupingKeySchema.map(_.dataType) ++ bufferSchema.map(_.dataType))}")
+                joined
+              }
+            }
+
+            val kvIterator = KeyValueToInternalRowIterator(part.aggregateStore.iterator(),
+              generateRowProjection(),
+              groupingKeySchema.map(_.dataType) ++ bufferSchema.map(_.dataType))
+
+            SetRDDHashSetPartition(kvIterator, schemaInfo)
+          }))
+
+          bigDatalogContext.setRecursiveRDD(relationName, deltaRDD.asInstanceOf[RDD[InternalRow]])
+
+          newAllRDD
+        } else _allRDD
+      }
+    }
+
     cachingFun = _cachingFun
     if (child.isInstanceOf[Exchange] && child.children.head.isInstanceOf[MonotonicAggregate])
       child.children.head.asInstanceOf[MonotonicAggregate].cachingFun = cachingFun
@@ -93,17 +147,37 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
   }
 
   protected override def doExecute(): RDD[InternalRow] = attachTree(this, "execute") {
-    //val aggregateFunction = completeAggregateExpressions.head.asInstanceOf[MonotonicAggregateFunction]
-    // not partial, then full - merge into exising rdd
+    val numInputRows = longMetric("numInputRows")
+    val numOutputRows = longMetric("numOutputRows")
+    val dataSize = longMetric("dataSize")
+    val spillSize = longMetric("spillSize")
+
+    // not partial, then full - merge into existing rdd
     // first iteration - allRDD will be null
     if (allRDD == null) {
       if (!child.outputPartitioning.satisfies(this.requiredChildDistribution.head))
         throw new SparkException("There is a missing exchange operator which should have repartitioned the input rdd!")
 
-      allRDD = AggregateSetRDD(child.execute(), schema, this)
+      val aggregateSetRDDPartitions = {
+        val keyPositions = Array.fill(schema.length)(1)
+        // last column is aggregate value
+        keyPositions(schema.length - 1) = 0
+        val schemaInfo = new SchemaInfo(schema, keyPositions)
+
+        // likely the iterator is produced from a shuffle or base relation
+        val output = child.execute().mapPartitionsInternal(iter => {
+          val outputIter = getMonotonicAggregationIterator(iter, null, numInputRows, numOutputRows, dataSize, spillSize)
+
+          Iterator(new AggregateSetRDDPartition(outputIter.hashMap, schemaInfo, this))
+        }, true)
+
+        output.asInstanceOf[RDD[AggregateSetRDDPartition]]
+      }
+
+      allRDD = new AggregateSetRDD(aggregateSetRDDPartitions, this)
       allRDD
     } else {
-      val (temp1, temp2) = allRDD.update(child.execute(), cachingFun)
+      val (temp1, temp2) = allRDD.update(child.execute(), cachingFun, numInputRows, numOutputRows, dataSize, spillSize)
       allRDD = temp1.asInstanceOf[AggregateSetRDD]
       temp2
     }
@@ -124,13 +198,12 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
     }
   }
 
-  def getAggregationIterator(iter: Iterator[InternalRow],
-                             aggregateStore: UnsafeFixedWidthMonotonicAggregationMap): TungstenMonotonicAggregationIterator = {
-    val numInputRows = longMetric("numInputRows")
-    val numOutputRows = longMetric("numOutputRows")
-    val dataSize = longMetric("dataSize")
-    val spillSize = longMetric("spillSize")
-
+  def getMonotonicAggregationIterator(iter: Iterator[InternalRow],
+                                      aggregateStore: UnsafeFixedWidthMinMaxMonotonicAggregationMap,
+                                      numInputRows: LongSQLMetric,
+                                      numOutputRows: LongSQLMetric,
+                                      dataSize: LongSQLMetric,
+                                      spillSize: LongSQLMetric): TungstenMonotonicAggregationIterator = {
     new TungstenMonotonicAggregationIterator(
       groupingExpressions,
       nonCompleteAggregateExpressions,
@@ -204,6 +277,8 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
     val groupingAttributes = groupingExpressions.map(_.toAttribute)
     val bufferAttributes = allAggregateFunctions.flatMap(_.aggBufferAttributes)
 
+    //logInfo(s"resultProjection: grouping ${groupingAttributes.mkString(",")} aggregated ${bufferAttributes.mkString(",")}")
+
     aggregationMode match {
       // Partial-only or PartialMerge-only: every output row is basically the values of
       // the grouping expressions and the corresponding aggregation buffer.
@@ -216,8 +291,7 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
           unsafeRowJoiner.join(currentGroupingKey, currentBuffer)
         }
 
-      // Final-only, Complete-only and Final-Complete: a output row is generated based on
-      // resultExpressions.
+      // Final-only, Complete-only and Final-Complete: a output row is generated based on resultExpressions.
       case (Some(Final), None) | (Some(Final) | None, Some(Complete)) =>
         val joinedRow = new JoinedRow()
         val evalExpressions = allAggregateFunctions.map {
@@ -226,27 +300,18 @@ class MonotonicAggregate(requiredChildDistributionExpressions: Option[Seq[Expres
         }
         val expressionAggEvalProjection = newMutableProjection(evalExpressions, bufferAttributes)()
         // These are the attributes of the row produced by `expressionAggEvalProjection`
-        val aggregateResultSchema = nonCompleteAggregateAttributes ++ completeAggregateAttributes
         val aggregateResult = new SpecificMutableRow(aggregateResultSchema.map(_.dataType))
         expressionAggEvalProjection.target(aggregateResult)
         val resultProjection =
           UnsafeProjection.create(resultExpressions, groupingAttributes ++ aggregateResultSchema)
 
-        //val allImperativeAggregateFunctions: Array[ImperativeAggregate] =
-        //  allAggregateFunctions.collect { case func: ImperativeAggregate => func}
-
         (currentGroupingKey: UnsafeRow, currentBuffer: UnsafeRow) => {
+          //logInfo(s"currentGroupingKey: ${Utils.printRow(currentGroupingKey, groupingAttributes.map(_.dataType))} " +
+          //  s"currentBuffer: ${Utils.printRow(currentBuffer, bufferAttributes.map(_.dataType))}")
           // Generate results for all expression-based aggregate functions.
           expressionAggEvalProjection(currentBuffer)
-          // Generate results for all imperative aggregate functions.
-          /*var i = 0
-          while (i < allImperativeAggregateFunctions.length) {
-            aggregateResult.update(
-              allImperativeAggregateFunctionPositions(i),
-              allImperativeAggregateFunctions(i).eval(currentBuffer))
-            i += 1
-          }*/
           resultProjection(joinedRow(currentGroupingKey, aggregateResult))
+          //logInfo(s"result: ${Utils.printRow(result, (groupingAttributes ++ aggregateResultSchema).map(_.dataType))}")
         }
       }
     }

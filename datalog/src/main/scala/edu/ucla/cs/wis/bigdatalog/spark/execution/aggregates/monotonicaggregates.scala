@@ -17,13 +17,28 @@
 
 package edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates
 
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, AttributeSet, Expression, Greatest, Least, Literal, Unevaluable}
+import org.apache.spark.sql.catalyst.expressions.{Add, AttributeReference, AttributeSet, Cast, Coalesce, Expression, Greatest, Least, Literal, MutableRow, Unevaluable}
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.util.TypeUtils
-import org.apache.spark.sql.types.{AbstractDataType, AnyDataType, DataType}
+import org.apache.spark.sql.types._
 
 abstract class MonotonicAggregateFunction extends DeclarativeAggregate with Serializable {}
+
+abstract class DeltaAggregateFunction extends MonotonicAggregateFunction {
+  /**
+    * Updates its aggregation buffer, located in `mutableAggBuffer`, based on the given `inputRow`.
+    *
+    * Use `fieldNumber + mutableAggBufferOffset` to access fields of `mutableAggBuffer`.
+    * This is just like ImperativeAggregate
+    */
+  def update(mutableAggBuffer: MutableRow, inputRow: InternalRow): Unit
+
+  def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): DeltaAggregateFunction
+
+  def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): DeltaAggregateFunction
+}
 
 case class MMax(child: Expression) extends MonotonicAggregateFunction {
 
@@ -96,6 +111,99 @@ case class MMin(child: Expression) extends MonotonicAggregateFunction {
 
   override lazy val evaluateExpression: AttributeReference = mmin
 }
+
+case class MSum(subGroupingKey: Expression,
+                aggregateArgument: Expression,
+                mutableAggBufferOffset: Int = 0,
+                inputAggBufferOffset: Int = 0)
+  extends DeltaAggregateFunction {
+
+  def this(subGroupingKey: Expression, aggregateArgument: Expression) =
+    this(subGroupingKey, aggregateArgument, mutableAggBufferOffset = 0, inputAggBufferOffset = 0)
+
+  override def children: Seq[Expression] = aggregateArgument :: Nil
+
+  override def nullable: Boolean = true
+
+  // Return data type.
+  override def dataType: DataType = resultType
+
+  override def inputTypes: Seq[AbstractDataType] =
+    Seq(TypeCollection(LongType, DoubleType))
+
+  override def checkInputDataTypes(): TypeCheckResult =
+    TypeUtils.checkForNumericExpr(aggregateArgument.dataType, "function msum")
+
+  private lazy val resultType = aggregateArgument.dataType match {
+    //case DecimalType.Fixed(precision, scale) =>
+    //  DecimalType.bounded(precision + 10, scale)
+    // TODO: Remove this line once we remove the NullType from inputTypes.
+    case NullType => IntegerType
+    case _ => aggregateArgument.dataType
+  }
+
+  private lazy val subAggregationDataType = aggregateArgument.dataType
+
+  private lazy val msumDataType = resultType
+
+  private lazy val msum = AttributeReference("msum", msumDataType)()
+
+  var max: AttributeReference = _
+
+  private lazy val zero = Cast(Literal(0), msumDataType)
+
+  override lazy val aggBufferAttributes = msum :: Nil
+
+  override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): DeltaAggregateFunction =
+    MSum(subGroupingKey, aggregateArgument, newMutableAggBufferOffset, inputAggBufferOffset)
+
+  override def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): DeltaAggregateFunction =
+    MSum(subGroupingKey, aggregateArgument, mutableAggBufferOffset, newInputAggBufferOffset)
+
+  override lazy val initialValues: Seq[Expression] = Seq(
+    /* msum = */ Literal.create(null, msumDataType)
+  )
+
+  lazy val initialSubKeyValues: Seq[Expression] = Seq(
+    Literal.create(null, subAggregationDataType)
+  )
+
+  override lazy val updateExpressions: Seq[Expression] = Seq(
+    /* msum = */
+    Coalesce(Seq(Add(Coalesce(Seq(msum, zero)), Cast(aggregateArgument, msumDataType)), msum))
+  )
+
+  override lazy val mergeExpressions: Seq[Expression] = {
+    val add = Add(Coalesce(Seq(msum.left, zero)), Cast(max, msumDataType))
+    Seq(
+      /* msum = */
+      Coalesce(Seq(add, msum.left))
+    )
+  }
+
+  lazy val updateFun: (MutableRow, InternalRow) => Unit = {
+    if (subAggregationDataType == IntegerType) {
+      (mutableAggBuffer: MutableRow, inputRow: InternalRow) => {
+        val previousValue = mutableAggBuffer.getInt(mutableAggBufferOffset)
+        val deltaValue = inputRow.getInt(inputAggBufferOffset)
+        mutableAggBuffer.setLong(mutableAggBufferOffset, previousValue + deltaValue)
+      }
+    } else {
+      (mutableAggBuffer: MutableRow, inputRow: InternalRow) => {
+        val previousValue = mutableAggBuffer.getLong(mutableAggBufferOffset)
+        val deltaValue = inputRow.getLong(inputAggBufferOffset)
+        mutableAggBuffer.setLong(mutableAggBufferOffset, previousValue + deltaValue)
+      }
+    }
+  }
+
+  override def update(mutableAggBuffer: MutableRow, inputRow: InternalRow): Unit = {
+    updateFun(mutableAggBuffer, inputRow)
+  }
+
+  override lazy val evaluateExpression: Expression = Cast(msum, resultType)
+}
+
 
 case class MonotonicAggregateExpression(aggregateFunction: MonotonicAggregateFunction,
                                         mode: AggregateMode,

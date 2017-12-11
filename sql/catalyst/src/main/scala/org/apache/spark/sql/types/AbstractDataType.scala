@@ -79,7 +79,8 @@ private[sql] class TypeCollection(private val types: Seq[AbstractDataType])
 }
 
 
-private[sql] object TypeCollection {
+//private[sql]
+object TypeCollection {
 
   /**
    * Types that can be ordered/compared. In the long run we should probably make this a trait

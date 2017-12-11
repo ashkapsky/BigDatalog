@@ -54,4 +54,9 @@ case class NonLinearRecursiveRelation(name : String, output : Seq[Attribute], pa
   extends RecursiveRelation("all_" + name, output, partitioning)
 
 case class AggregateRelation(name : String, output : Seq[Attribute], partitioning: Seq[Int])
-  extends RecursiveRelation(name, output, partitioning)
+  extends RecursiveRelation(name, output, partitioning) {
+
+  override def doExecute(): RDD[InternalRow] = {
+    bigDatalogContext.getRDD(name)
+  }
+}

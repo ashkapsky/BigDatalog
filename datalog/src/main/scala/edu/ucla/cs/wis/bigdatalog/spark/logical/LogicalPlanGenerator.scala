@@ -110,7 +110,10 @@ class LogicalPlanGenerator(operatorProgram: OperatorProgram, bigDatalogContext: 
 
         val recursion = cliqueOperator.getEvaluationType match {
           case EvaluationType.MonotonicSemiNaive =>
-            AggregateRecursion(cliqueOperator.getName, cliqueOperator.isLinearRecursion, exitRulesPlan, recursiveRulesPlan, partitioning)
+            if (operator.getOperatorType == OperatorType.MUTUAL_RECURSIVE_CLIQUE)
+              MutualAggregateRecursion(cliqueOperator.getName, cliqueOperator.isLinearRecursion, exitRulesPlan, recursiveRulesPlan, partitioning)
+            else
+              AggregateRecursion(cliqueOperator.getName, cliqueOperator.isLinearRecursion, exitRulesPlan, recursiveRulesPlan, partitioning)
           case EvaluationType.SemiNaive =>
             if (operator.getOperatorType == OperatorType.MUTUAL_RECURSIVE_CLIQUE)
               MutualRecursion(cliqueOperator.getName, cliqueOperator.isLinearRecursion, exitRulesPlan, recursiveRulesPlan, partitioning)
@@ -293,12 +296,32 @@ class LogicalPlanGenerator(operatorProgram: OperatorProgram, bigDatalogContext: 
                 }
 
                 val exprs: Seq[Expression] = getAAExpression(aa.getTerm)
-                val aggregateName = if (aa.getName.equals(COUNT_DISTINCT)) "count" else aa.getName
-                aggregate = UnresolvedFunction(aggregateName, exprs, aa.getName.equals(COUNT_DISTINCT))
+                // our only distinct aggregate is count distinct
+                val isDistinct = aa.getName.equals(COUNT_DISTINCT)
+                val aggregateName = if (isDistinct) "count" else aa.getName
+
+                aggregate = aggregateName match {
+                  case "mcount" | "msum" =>
+                    if (exprs.size != 2)
+                      throw new SparkException(s"msum/mcount aggregate expects 2 arguments but received ${exprs.size}.")
+
+                    // in the exit rule, we convert msum to mmax and pull out the sub-grouping attributes
+                    if (isRecursive(operator)) {
+                      val argumentToAggregate = exprs(1)
+                      val subGroupingKey = exprs(0).asInstanceOf[NamedExpression]
+                      UnresolvedFunction(aggregateName, Seq(subGroupingKey, argumentToAggregate), false)
+                    } else {
+                      val argumentToAggregate = exprs(1)
+                      val subGroupingKey = exprs(0).asInstanceOf[NamedExpression]
+                      groupByArguments += subGroupingKey
+                      UnresolvedFunction("mmax", Seq(argumentToAggregate), false)
+                    }
+                  case _ => UnresolvedFunction(aggregateName, exprs, isDistinct)
+                }
                 aggregateExpressions += UnresolvedAlias(Alias(aggregate, aliasName)())
               }
-              case v: Variable => if (!v.isAnonymous) groupByArguments +=
-                toExpressionFromVariableQualified(operator.getChildren)(v)
+              case v: Variable if (!v.isAnonymous) =>
+                groupByArguments += toExpressionFromVariableQualified(operator.getChildren)(v)
               case d: DbTypeBase => groupByArguments += UnresolvedAlias(Alias(Literal.create(Utilities.getDbTypeBaseValue(d),
                 Utilities.getSparkDataType(d.getDataType)),
                 s"c_$count")())

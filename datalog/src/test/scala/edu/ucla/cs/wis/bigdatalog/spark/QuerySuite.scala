@@ -68,8 +68,7 @@ abstract class QuerySuite extends FunSuite with Logging {
       } else {
         if (results.size != answers.size) {
           displayDifferences(results.map(_.toString), answers)
-          // yes this will fail
-          assert(results.size == answers.size)
+          fail(s"Result set size (${results.size}) did not match expected Answer set size (${answers.size}).")
         } else {
           for (result <- results)
             assert(answers.contains(result.toString()))

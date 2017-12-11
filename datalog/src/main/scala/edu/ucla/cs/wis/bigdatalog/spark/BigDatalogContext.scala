@@ -24,9 +24,9 @@ import org.apache.spark.sql.execution.ui.SQLListener
 import edu.ucla.cs.wis.bigdatalog.spark.logical.LogicalPlanGenerator
 import edu.ucla.cs.wis.bigdatalog.compiler.QueryForm
 import edu.ucla.cs.wis.bigdatalog.spark.execution.ShuffleDistinct
-import edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates.{MMax, MMin}
+import edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates.{MMax, MMin, MSum}
 import edu.ucla.cs.wis.bigdatalog.system.{DeALSContext, ReturnStatus, SystemCommandResult}
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.{Logging, SparkContext}
 import org.apache.spark.sql.catalyst.InternalRow
@@ -61,6 +61,10 @@ class BigDatalogContext(@transient override val sparkContext: SparkContext,
   functionRegistry.registerFunction("mmin", mmin._2._1, mmin._2._2)
   val mmax = FunctionRegistry.expression[MMax]("mmax")
   functionRegistry.registerFunction("mmax", mmax._2._1, mmax._2._2)
+  val msum = FunctionRegistry.expression[MSum]("msum")
+  functionRegistry.registerFunction("msum", msum._2._1, msum._2._2)
+  val mcount = FunctionRegistry.expression[MSum]("mcount")
+  functionRegistry.registerFunction("mcount", mcount._2._1, mcount._2._2)
 
   @transient
   override lazy val analyzer: Analyzer = new Analyzer(catalog, functionRegistry, conf) {}

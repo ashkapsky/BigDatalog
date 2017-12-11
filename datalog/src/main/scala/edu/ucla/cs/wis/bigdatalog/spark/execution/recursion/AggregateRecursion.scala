@@ -77,6 +77,8 @@ case class AggregateRecursion(name : String,
 
       count = deltaSPrime.count()
 
+      logInfo(s"iteration produced Delta' w/ size $count")
+
       if (count > 0) {
         // S = S U deltaS'
         all = all.union(deltaSPrime)
@@ -108,7 +110,7 @@ case class AggregateRecursion(name : String,
     var count: Long = 1 // so we loop at least once
     while (count > 0) {
       // deltaS' = T_R(deltaS) - S
-      val deltaSPrime = recursiveRulesAggregates.execute(allRDD, persist)
+      val deltaSPrime = recursiveRulesAggregates.execute(allRDD, persist, this.name)
       count = deltaSPrime.count()
 
       if (count > 0) {
@@ -132,13 +134,14 @@ case class AggregateRecursion(name : String,
 
   override def doSingleJobPSNWithSetRDD(): RDD[InternalRow] = {
     // S = T_E(M)
-    allRDD = exitRulesAggregates.execute(null, persist).asInstanceOf[AggregateSetRDD]
+    allRDD = exitRulesAggregates.execute(null, persist, this.name).asInstanceOf[AggregateSetRDD]
     persist(allRDD)
-    allRDD.count()
+    val size = allRDD.count()
+
+    logInfo(s"Exit Rule Completed.  Delta' size: $size")
 
     val deltaS = allRDD
 
-    //persist(deltaS)
     bigDatalogContext.setRecursiveRDD(this.name, deltaS)
     bigDatalogContext.setRecursiveRDD("all_" + this.name, allRDD)
 
@@ -153,7 +156,7 @@ case class AggregateRecursion(name : String,
   var previousTime : Long = _
   override def setupIteration(fpjd: FixedPointJobDefinition, deltaSPrimeRDD: RDD[_]): RDD[_] = {
     // deltaS' = T_R(deltaS) - S
-    val nextDeltaSPrimeRDD = recursiveRulesAggregates.execute(allRDD, persist)
+    val nextDeltaSPrimeRDD = recursiveRulesAggregates.execute(allRDD, persist, this.name)
     persist(nextDeltaSPrimeRDD)
     // the parent of allRDD is cached in updateEMSN()
     // S = S U deltaS'

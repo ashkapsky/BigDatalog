@@ -102,6 +102,48 @@ case class AggregateRecursion(name: String,
   override def output: Seq[Attribute] = right.output
 }
 
+case class MutualAggregateRecursion(name: String,
+                                    isLinear: Boolean,
+                                    left: LogicalPlan,
+                                    right: LogicalPlan,
+                                    partitioning: Seq[Int]) extends BinaryNode {
+
+  override def output: Seq[Attribute] = right.output
+
+  override def children: Seq[LogicalPlan] = {
+    if (left == null)
+      Seq(right)
+    else
+      Seq(left, right)
+  }
+
+  override def generateTreeString(depth: Int,
+                                  lastChildren: Seq[Boolean],
+                                  builder: StringBuilder): StringBuilder = {
+    if (depth > 0) {
+      lastChildren.init.foreach { isLast =>
+        val prefixFragment = if (isLast) "   " else ":  "
+        builder.append(prefixFragment)
+      }
+
+      val branch = if (lastChildren.last) "+- " else ":- "
+      builder.append(branch)
+    }
+
+    builder.append(simpleString)
+    builder.append("\n")
+
+    if (children.nonEmpty) {
+      val exitRule = children.init
+      if (exitRule != null)
+        exitRule.foreach(_.generateTreeString(depth + 1, lastChildren :+ false, builder))
+      children.last.generateTreeString(depth + 1, lastChildren :+ true, builder)
+    }
+
+    builder
+  }
+}
+
 case class AggregateRelation(_name: String, output: Seq[Attribute], partitioning: Seq[Int]) extends LeafNode {
   override def statistics: Statistics = Statistics(Long.MaxValue)
   var name = _name

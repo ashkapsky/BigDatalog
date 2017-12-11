@@ -130,7 +130,6 @@ object Utilities {
         i += 1
       }
       new GenericInternalRow(ar)
-      //ar(i) = scalaToCatalystTypeConverters(i)(stringToScalaTypeConverter(i).apply(splitLine(i)))
     })
 
     bigDatalogContext.sparkContext.parallelize(rows, numPartitions)
@@ -157,4 +156,18 @@ object Utilities {
       case ex:Exception => value.toDouble.toInt
     }
   }
+
+  /*def printRow(row: InternalRow, schema: Seq[DataType]): String = {
+    if (row.numFields != schema.size) {
+      println(s"row had ${row.numFields} fields, schema had ${schema.size} fields")
+    }
+
+    val result = schema.zipWithIndex.map({case (col: DataType, index: Int) =>
+      col match {
+        case IntegerType => row.getInt(index)
+        case LongType => row.getLong(index)
+      }
+    }).mkString(",")
+    result
+  }*/
 }

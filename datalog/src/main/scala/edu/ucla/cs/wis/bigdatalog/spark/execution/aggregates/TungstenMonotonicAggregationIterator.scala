@@ -19,19 +19,18 @@ package edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates
 
 import java.util.{HashMap => JavaHashMap}
 
-import edu.ucla.cs.wis.bigdatalog.spark.storage.map.UnsafeFixedWidthMonotonicAggregationMap
-
-import scala.collection.mutable.ArrayBuffer
+import edu.ucla.cs.wis.bigdatalog.spark.storage.map.{UnsafeFixedWidthMinMaxMonotonicAggregationMap, UnsafeFixedWidthSumMinMaxMonotonicAggregationMap}
 import org.apache.spark.unsafe.KVIterator
 import org.apache.spark.{InternalAccumulator, Logging, TaskContext}
 import org.apache.spark.sql.catalyst.expressions.{JoinedRow, SpecificMutableRow, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.UnsafeKVExternalSorter
+import org.apache.spark.sql.execution.aggregate.Utils
 import org.apache.spark.sql.execution.metric.LongSQLMetric
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{DataType, IntegerType, LongType, StructType}
 
+import scala.collection.JavaConverters._
 /**
   * An iterator used to evaluate aggregate functions. It operates on [[UnsafeRow]]s.
   *
@@ -99,7 +98,7 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
                                            numOutputRows: LongSQLMetric,
                                            dataSize: LongSQLMetric,
                                            spillSize: LongSQLMetric,
-                                           aggregateStore: UnsafeFixedWidthMonotonicAggregationMap)
+                                           aggregateStore: Object)
   extends Iterator[UnsafeRow] with Logging {
 
   ///////////////////////////////////////////////////////////////////////////
@@ -112,6 +111,13 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
   private[this] val allAggregateExpressions: Seq[AggregateExpression] =
     nonCompleteAggregateExpressions ++ completeAggregateExpressions
 
+  val isMSum = allAggregateExpressions.exists(_.aggregateFunction.isInstanceOf[MSum])
+
+  val allAggregateSubKeyExpressions: Seq[AggregateExpression] =
+    if (isMSum) {
+      allAggregateExpressions.map(ae => AggregateExpression(Max(ae.aggregateFunction.asInstanceOf[MSum].max), Final, false))
+  } else null
+
   // Check to make sure we do not have more than three modes in our AggregateExpressions.
   // If we have, users are hitting a bug and we throw an IllegalStateException.
   if (allAggregateExpressions.map(_.mode).distinct.length > 2) {
@@ -121,17 +127,10 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
 
   // Remember spill data size of this task before execute this operator so that we can
   // figure out how many bytes we spilled for this operator.
-  //private
   val spillSizeBefore = TaskContext.get().taskMetrics().memoryBytesSpilled
 
   //
   // The modes of AggregateExpressions. Right now, we can handle the following mode:
-  //  - Partial-only:
-  //      All AggregateExpressions have the mode of Partial.
-  //      For this case, aggregationMode is (Some(Partial), None).
-  //  - PartialMerge-only:
-  //      All AggregateExpressions have the mode of PartialMerge).
-  //      For this case, aggregationMode is (Some(PartialMerge), None).
   //  - Final-only:
   //      All AggregateExpressions have the mode of Final.
   //      For this case, aggregationMode is (Some(Final), None).
@@ -146,7 +145,6 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
   //  - Grouping-only:
   //      There is no AggregateExpression. For this case, AggregationMode is (None,None).
   //
-  //private[this]
   var aggregationMode: (Option[AggregateMode], Option[AggregateMode]) = {
     nonCompleteAggregateExpressions.map(_.mode).distinct.headOption ->
       completeAggregateExpressions.map(_.mode).distinct.headOption
@@ -154,8 +152,8 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
 
   // Initialize all AggregateFunctions by binding references, if necessary,
   // and setting inputBufferOffset and mutableBufferOffset.
+  var mutableBufferOffset = 0
   private def initializeAllAggregateFunctions(startingInputBufferOffset: Int): Array[AggregateFunction] = {
-    var mutableBufferOffset = 0
     var inputBufferOffset: Int = startingInputBufferOffset
     val functions = new Array[AggregateFunction](allAggregateExpressions.length)
     var i = 0
@@ -179,6 +177,8 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
           val updatedFunc = func match {
             case function: ImperativeAggregate =>
               function.withNewInputAggBufferOffset(inputBufferOffset)
+            case function: DeltaAggregateFunction =>
+              function.withNewInputAggBufferOffset(inputBufferOffset)
             case function => function
           }
           inputBufferOffset += func.aggBufferSchema.length
@@ -190,6 +190,8 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
           // mutableBufferOffset happens after all potential bindReference operations
           // because bindReference will create a new instance of the function.
           function.withNewMutableAggBufferOffset(mutableBufferOffset)
+        case function: DeltaAggregateFunction =>
+          function.withNewMutableAggBufferOffset(mutableBufferOffset)
         case function => function
       }
       mutableBufferOffset += funcWithUpdatedAggBufferOffset.aggBufferSchema.length
@@ -199,28 +201,32 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
     functions
   }
 
-  //private[this]
-  var allAggregateFunctions: Array[AggregateFunction] =
-    initializeAllAggregateFunctions(initialInputBufferOffset)
-
-  // Positions of those imperative aggregate functions in allAggregateFunctions.
-  // For example, say that we have func1, func2, func3, func4 in aggregateFunctions, and
-  // func2 and func3 are imperative aggregate functions. Then
-  // allImperativeAggregateFunctionPositions will be [1, 2]. Note that this does not need to be
-  // updated when falling back to sort-based aggregation because the positions of the aggregate
-  // functions do not change in that case.
-  private[this] val allImperativeAggregateFunctionPositions: Array[Int] = {
-    val positions = new ArrayBuffer[Int]()
+  private def initializeAllAggregateSubKeyFunctions: Array[AggregateFunction] = {
+    var mutableBufferOffset = 0
+    val functions = new Array[AggregateFunction](allAggregateSubKeyExpressions.length)
     var i = 0
-    while (i < allAggregateFunctions.length) {
-      allAggregateFunctions(i) match {
-        case agg: DeclarativeAggregate =>
-        case _ => positions += i
-      }
+    while (i < allAggregateSubKeyExpressions.length) {
+      val func = allAggregateSubKeyExpressions(i).aggregateFunction
+      //val aggregateExpressionIsNonComplete = i < nonCompleteAggregateExpressions.length
+      // We need to use this mode instead of func.mode in order to handle aggregation mode switching
+      // when switching to sort-based aggregation:
+      mutableBufferOffset += func.aggBufferSchema.length
+      functions(i) = func
       i += 1
     }
-    positions.toArray
+    functions
   }
+
+  var allAggregateFunctions: Array[AggregateFunction] = if (isMSum) initializeAllAggregateFunctions(0)
+    else initializeAllAggregateFunctions(initialInputBufferOffset)
+
+  var allSubAggregateFunctions: Array[AggregateFunction] = if (isMSum)
+    initializeAllAggregateSubKeyFunctions
+  else null
+
+  var subGroupingExpressions = allAggregateExpressions.map(_.aggregateFunction)
+    .collect {case msum: MSum => msum.subGroupingKey}
+    .map {_.asInstanceOf[NamedExpression]}
 
   ///////////////////////////////////////////////////////////////////////////
   // Part 2: Methods and fields used by setting aggregation buffer values,
@@ -234,67 +240,71 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
   private[this] val expressionAggInitialProjection: MutableProjection = {
     val initExpressions = allAggregateFunctions.flatMap {
       case ae: DeclarativeAggregate => ae.initialValues
-      // For the positions corresponding to imperative aggregate functions, we'll use special
-      // no-op expressions which are ignored during projection code-generation.
-      case i: ImperativeAggregate => Seq.fill(i.aggBufferAttributes.length)(NoOp)
     }
     newMutableProjection(initExpressions, Nil)()
   }
 
   // Creates a new aggregation buffer and initializes buffer values.
   // This function should be only called at most three times (when we create the hash map,
-  // when we switch to sort-based aggregation, and when we create the re-used buffer for
-  // sort-based aggregation).
+  // when we switch to sort-based aggregation, and when we create the re-used buffer for sort-based aggregation).
   private def createNewAggregationBuffer(): UnsafeRow = {
-    val bufferSchema = allAggregateFunctions.flatMap(_.aggBufferAttributes)
-    val buffer: UnsafeRow = UnsafeProjection.create(bufferSchema.map(_.dataType))
+    val bufferSchema = allAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType)
+    val buffer: UnsafeRow = UnsafeProjection.create(bufferSchema)
       .apply(new GenericMutableRow(bufferSchema.length))
     // Initialize declarative aggregates' buffer values
     expressionAggInitialProjection.target(buffer)(EmptyRow)
-    // Initialize imperative aggregates' buffer values
-    allAggregateFunctions.collect { case f: ImperativeAggregate => f }.foreach(_.initialize(buffer))
+    buffer
+  }
+
+  // The projection used to initialize sub buffer values for all expression-based aggregates.
+  private[this] lazy val expressionSubAggInitialProjection: MutableProjection = {
+    val initExpressions = allAggregateFunctions.flatMap {
+      case ae: MSum => ae.initialSubKeyValues
+    }
+    newMutableProjection(initExpressions, Nil)()
+  }
+
+  // Creates a new aggregation buffer for sub aggregate initializes buffer values.
+  private def createNewSubAggregationBuffer(): UnsafeRow = {
+    val bufferSchema = allSubAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType)
+    val buffer: UnsafeRow = UnsafeProjection.create(bufferSchema)
+      .apply(new GenericMutableRow(bufferSchema.length))
+    // Initialize declarative aggregates' buffer values
+    expressionSubAggInitialProjection.target(buffer)(EmptyRow)
+    buffer
+  }
+
+  // The projection used to initialize buffer values for all delta aggregates.
+  private[this] lazy val expressionDeltaInitialProjection: MutableProjection = {
+    val initExpressions = allAggregateFunctions.flatMap {
+      case ae: DeltaAggregateFunction => ae.initialValues
+    }
+    newMutableProjection(initExpressions, Nil)()
+  }
+
+  // Creates a new buffer for the delta-maintanence of msum aggregates and initializes buffer values.
+  private def createDeltaBuffer(): UnsafeRow = {
+    val bufferSchema = subGroupingExpressions.map(_.dataType).toArray
+    val buffer: UnsafeRow = UnsafeProjection.create(bufferSchema)
+      .apply(new GenericMutableRow(bufferSchema.length))
+    // Initialize declarative aggregates' buffer values
+    expressionDeltaInitialProjection.target(buffer)(EmptyRow)
     buffer
   }
 
   // Creates a function used to process a row based on the given inputAttributes
   private def generateProcessRow(inputAttributes: Seq[Attribute]): (UnsafeRow, InternalRow) => Unit = {
-
     val aggregationBufferAttributes = allAggregateFunctions.flatMap(_.aggBufferAttributes)
     val joinedRow = new JoinedRow()
 
     aggregationMode match {
-      // Partial-only
-      case (Some(Partial), None) =>
-        val updateExpressions = allAggregateFunctions.flatMap {
-          case ae: DeclarativeAggregate => ae.updateExpressions
-          case agg: AggregateFunction => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
-        }
-        val imperativeAggregateFunctions: Array[ImperativeAggregate] =
-          allAggregateFunctions.collect { case func: ImperativeAggregate => func}
-        val expressionAggUpdateProjection =
-          newMutableProjection(updateExpressions, aggregationBufferAttributes ++ inputAttributes)()
-
-        (currentBuffer: UnsafeRow, row: InternalRow) => {
-          expressionAggUpdateProjection.target(currentBuffer)
-          // Process all expression-based aggregate functions.
-          expressionAggUpdateProjection(joinedRow(currentBuffer, row))
-          // Process all imperative aggregate functions
-          /*APS - Monotonic aggregates are implemented as declarative aggregates
-          var i = 0
-          while (i < imperativeAggregateFunctions.length) {
-            imperativeAggregateFunctions(i).update(currentBuffer, row)
-            i += 1
-          }*/
-        }
-
-      // PartialMerge-only or Final-only
-      case (Some(PartialMerge), None) | (Some(Final), None) =>
+      // Final-only
+      case (Some(Final), None) =>
         val mergeExpressions = allAggregateFunctions.flatMap {
           case ae: DeclarativeAggregate => ae.mergeExpressions
           case agg: AggregateFunction => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
         }
-        //val imperativeAggregateFunctions: Array[ImperativeAggregate] =
-        //  allAggregateFunctions.collect { case func: ImperativeAggregate => func}
+
         // This projection is used to merge buffer values for all expression-based aggregates.
         val expressionAggMergeProjection =
           newMutableProjection(mergeExpressions, aggregationBufferAttributes ++ inputAttributes)()
@@ -302,119 +312,57 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
         (currentBuffer: UnsafeRow, row: InternalRow) => {
           // Process all expression-based aggregate functions.
           expressionAggMergeProjection.target(currentBuffer)(joinedRow(currentBuffer, row))
-          // Process all imperative aggregate functions.
-          /*APS - Monotonic aggregates are implemented as declarative aggregates
-          var i = 0
-          while (i < imperativeAggregateFunctions.length) {
-            imperativeAggregateFunctions(i).merge(currentBuffer, row)
-            i += 1
-          }*/
         }
-
-      // Final-Complete
-      case (Some(Final), Some(Complete)) =>
-        val completeAggregateFunctions: Array[AggregateFunction] =
-          allAggregateFunctions.takeRight(completeAggregateExpressions.length)
-        val completeImperativeAggregateFunctions: Array[ImperativeAggregate] =
-          completeAggregateFunctions.collect { case func: ImperativeAggregate => func }
-        val nonCompleteAggregateFunctions: Array[AggregateFunction] =
-          allAggregateFunctions.take(nonCompleteAggregateExpressions.length)
-        val nonCompleteImperativeAggregateFunctions: Array[ImperativeAggregate] =
-          nonCompleteAggregateFunctions.collect { case func: ImperativeAggregate => func }
-
-        val completeOffsetExpressions =
-          Seq.fill(completeAggregateFunctions.map(_.aggBufferAttributes.length).sum)(NoOp)
-        val mergeExpressions =
-          nonCompleteAggregateFunctions.flatMap {
-            case ae: DeclarativeAggregate => ae.mergeExpressions
-            case agg: AggregateFunction => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
-          } ++ completeOffsetExpressions
-        val finalMergeProjection =
-          newMutableProjection(mergeExpressions, aggregationBufferAttributes ++ inputAttributes)()
-
-        // We do not touch buffer values of aggregate functions with the Final mode.
-        val finalOffsetExpressions =
-          Seq.fill(nonCompleteAggregateFunctions.map(_.aggBufferAttributes.length).sum)(NoOp)
-        val updateExpressions = finalOffsetExpressions ++ completeAggregateFunctions.flatMap {
-          case ae: DeclarativeAggregate => ae.updateExpressions
-          case agg: AggregateFunction => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
-        }
-        val completeUpdateProjection =
-          newMutableProjection(updateExpressions, aggregationBufferAttributes ++ inputAttributes)()
-
-        (currentBuffer: UnsafeRow, row: InternalRow) => {
-          val input = joinedRow(currentBuffer, row)
-          // For all aggregate functions with mode Complete, update buffers.
-          completeUpdateProjection.target(currentBuffer)(input)
-          /*APS - Monotonic aggregates are implemented as declarative aggregates
-          var i = 0
-          while (i < completeImperativeAggregateFunctions.length) {
-            completeImperativeAggregateFunctions(i).update(currentBuffer, row)
-            i += 1}*/
-
-          // For all aggregate functions with mode Final, merge buffer values in row to currentBuffer.
-          finalMergeProjection.target(currentBuffer)(input)
-          /*APS - Monotonic aggregates are implemented as declarative aggregates
-          i = 0
-          while (i < nonCompleteImperativeAggregateFunctions.length) {
-            nonCompleteImperativeAggregateFunctions(i).merge(currentBuffer, row)
-            i += 1}*/
-        }
-
-      // Complete-only
-      case (None, Some(Complete)) =>
-        val completeAggregateFunctions: Array[AggregateFunction] =
-          allAggregateFunctions.takeRight(completeAggregateExpressions.length)
-        // All imperative aggregate functions with mode Complete.
-        val completeImperativeAggregateFunctions: Array[ImperativeAggregate] =
-          completeAggregateFunctions.collect { case func: ImperativeAggregate => func }
-
-        val updateExpressions = completeAggregateFunctions.flatMap {
-          case ae: DeclarativeAggregate => ae.updateExpressions
-          case agg: AggregateFunction => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
-        }
-        val completeExpressionAggUpdateProjection =
-          newMutableProjection(updateExpressions, aggregationBufferAttributes ++ inputAttributes)()
-
-        (currentBuffer: UnsafeRow, row: InternalRow) => {
-          // For all aggregate functions with mode Complete, update buffers.
-          completeExpressionAggUpdateProjection.target(currentBuffer)(joinedRow(currentBuffer, row))
-          /*APS - Monotonic aggregates are implemented as declarative aggregates
-          var i = 0
-          while (i < completeImperativeAggregateFunctions.length) {
-            completeImperativeAggregateFunctions(i).update(currentBuffer, row)
-            i += 1}*/
-        }
-
       // Grouping only.
       case (None, None) => (currentBuffer: UnsafeRow, row: InternalRow) => {false}
 
       case other =>
         throw new IllegalStateException(
-          s"${aggregationMode} should not be passed into TungstenAggregationIterator.")
+          s"${aggregationMode} should not be passed into TungstenMonotonicAggregationIterator.")
+    }
+  }
+
+  private def generateProcessRow2(inputAttributes: Seq[Attribute]): (UnsafeRow, InternalRow) => Unit = {
+    // this function produces the function that will update msum subkeymaps
+    val aggregationBufferAttributes = allSubAggregateFunctions.flatMap(_.aggBufferAttributes)
+    val joinedRow = new JoinedRow()
+
+    val updateExpressions = allSubAggregateFunctions.flatMap {
+      case ae: DeclarativeAggregate => ae.updateExpressions
+      case agg: AggregateFunction => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
+    }
+
+    // This projection is used to merge buffer values for all expression-based aggregates.
+    val expressionAggMergeProjection =
+      newMutableProjection(updateExpressions, aggregationBufferAttributes ++ inputAttributes)()
+
+    (currentBuffer: UnsafeRow, row: InternalRow) => {
+      // Process all expression-based aggregate functions.
+      expressionAggMergeProjection.target(currentBuffer)(joinedRow(currentBuffer, row))
+    }
+  }
+
+  private def generateApplyDelta(inputAttributes: Seq[Attribute]): (UnsafeRow, InternalRow) => Unit = {
+    // this function produces the function that will update msum
+    val deltaAggregateFunctions: Array[DeltaAggregateFunction] =
+      allAggregateFunctions.collect { case func: DeltaAggregateFunction => func}
+
+    (currentBuffer: UnsafeRow, row: InternalRow) => {
+      var i = 0
+      while (i < deltaAggregateFunctions.length) {
+        deltaAggregateFunctions(i).update(currentBuffer, row)
+        i += 1
+      }
     }
   }
 
   // Creates a function used to generate output rows.
   def generateResultProjection(): (UnsafeRow, UnsafeRow) => UnsafeRow = {
-
     val groupingAttributes = groupingExpressions.map(_.toAttribute)
     val bufferAttributes = allAggregateFunctions.flatMap(_.aggBufferAttributes)
 
     aggregationMode match {
-      // Partial-only or PartialMerge-only: every output row is basically the values of
-      // the grouping expressions and the corresponding aggregation buffer.
-      case (Some(Partial), None) | (Some(PartialMerge), None) =>
-        val groupingKeySchema = StructType.fromAttributes(groupingAttributes)
-        val bufferSchema = StructType.fromAttributes(bufferAttributes)
-        val unsafeRowJoiner = GenerateUnsafeRowJoiner.create(groupingKeySchema, bufferSchema)
-
-        (currentGroupingKey: UnsafeRow, currentBuffer: UnsafeRow) => {
-          unsafeRowJoiner.join(currentGroupingKey, currentBuffer)
-        }
-
-      // Final-only, Complete-only and Final-Complete: a output row is generated based on
-      // resultExpressions.
+      // Final-only, Complete-only and Final-Complete: a output row is generated based on resultExpressions.
       case (Some(Final), None) | (Some(Final) | None, Some(Complete)) =>
         val joinedRow = new JoinedRow()
         val evalExpressions = allAggregateFunctions.map {
@@ -429,21 +377,10 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
         val resultProjection =
           UnsafeProjection.create(resultExpressions, groupingAttributes ++ aggregateResultSchema)
 
-        val allImperativeAggregateFunctions: Array[ImperativeAggregate] =
-          allAggregateFunctions.collect { case func: ImperativeAggregate => func}
-
         (currentGroupingKey: UnsafeRow, currentBuffer: UnsafeRow) => {
           // Generate results for all expression-based aggregate functions.
           expressionAggEvalProjection(currentBuffer)
           // Generate results for all imperative aggregate functions.
-          /*APS - Monotonic aggregates are implemented as declarative aggregates
-          var i = 0
-          while (i < allImperativeAggregateFunctions.length) {
-            aggregateResult.update(
-              allImperativeAggregateFunctionPositions(i),
-              allImperativeAggregateFunctions(i).eval(currentBuffer))
-            i += 1
-          }*/
           resultProjection(joinedRow(currentGroupingKey, aggregateResult))
         }
 
@@ -461,28 +398,81 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
     }
   }
 
+  val groupProjectionAttributes = groupingExpressions
+
+  val subGroupProjectionAttributes = {
+    if (isMSum) (groupProjectionAttributes ++ allAggregateExpressions.map(_.aggregateFunction)
+      .collect { case msum: MSum => msum.subGroupingKey.asInstanceOf[NamedExpression] })
+    else Nil
+  }
+
   // An UnsafeProjection used to extract grouping keys from the input rows.
-  //private[this]
-  val groupProjection =
-    UnsafeProjection.create(groupingExpressions, originalInputAttributes)
+  val groupProjection = UnsafeProjection.create(groupProjectionAttributes, originalInputAttributes)
+
+  val subGroupProjection = UnsafeProjection.create(subGroupProjectionAttributes, originalInputAttributes)
 
   // A function used to process a input row. Its first argument is the aggregation buffer
   // and the second argument is the input row.
-  //private[this]
-  var processRow: (UnsafeRow, InternalRow) => Unit =
-    generateProcessRow(originalInputAttributes)
+  var processRow: (UnsafeRow, InternalRow) => Unit = if (isMSum) generateProcessRow2(originalInputAttributes) else generateProcessRow(originalInputAttributes)
+
+  // A function used to process the change to the running msums via delta-maintenance using the change to a subkey's max
+  // for example, for an X,Y,N when a new max D is produced for an X,Y,Z this function increases N by (D(new) - D(old))
+  // msum-only
+  var applyDelta: (UnsafeRow, InternalRow) => Unit = if (isMSum) generateApplyDelta(originalInputAttributes) else null
 
   // A function used to generate output rows based on the grouping keys (first argument)
   // and the corresponding aggregation buffer (second argument).
-  //private[this]
-  var generateOutput: (UnsafeRow, UnsafeRow) => UnsafeRow =
-    generateResultProjection()
+  var generateOutput: (UnsafeRow, UnsafeRow) => UnsafeRow = generateResultProjection()
 
   // An aggregation buffer containing initial buffer values. It is used to
   // initialize other aggregation buffers.
-  //private[this]
   val initialAggregationBuffer: UnsafeRow = createNewAggregationBuffer()
 
+  // msum-only
+  val initialSubAggregationBuffer: UnsafeRow = if (isMSum) createNewSubAggregationBuffer() else null
+
+  // msum-only
+  // re-useable buffer for delta computation for msum aggregates
+  val deltaBuffer: UnsafeRow = if (isMSum) createDeltaBuffer() else null
+
+  // msum-only
+  // re-useable function for delta computation for msum aggregates
+  var processDelta: (UnsafeRow, UnsafeRow) => Unit = if (isMSum) generateProcessDelta() else null
+
+  // msum-only
+  // generates function to compute change between previous and new msum values
+  def generateProcessDelta(): (UnsafeRow, UnsafeRow) => Unit = {
+    def deltaColumnFun(dataType: DataType, i: Int): (UnsafeRow, UnsafeRow) => Unit = {
+      dataType match {
+        case IntegerType =>
+          (beforeRow: UnsafeRow, afterRow: UnsafeRow) => {
+            val index = i
+            val before = beforeRow.getInt(index)
+            val after = afterRow.getInt(index)
+            deltaBuffer.setInt(index, after - before)
+          }
+        case LongType =>
+          (beforeRow: UnsafeRow, afterRow: UnsafeRow) => {
+            val index = i
+            val before = beforeRow.getLong(index)
+            val after = afterRow.getLong(index)
+            deltaBuffer.setLong(index, after - before)
+          }
+        case _ => throw new RuntimeException("Invalid data type for delta maintenance in msum.")
+      }
+    }
+
+    val deltaDataTypes = allSubAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType)
+    val deltaColumnFuns = deltaDataTypes.zipWithIndex.map(pair => deltaColumnFun(pair._1, pair._2))
+    val numberOfAggregates = deltaColumnFuns.length
+    (beforeRow: UnsafeRow, afterRow: UnsafeRow) => {
+      var i = 0
+      while (i < numberOfAggregates) {
+        deltaColumnFuns(i)(beforeRow, afterRow)
+        i += 1
+      }
+    }
+  }
   ///////////////////////////////////////////////////////////////////////////
   // Part 3: Methods and fields used by hash-based aggregation.
   ///////////////////////////////////////////////////////////////////////////
@@ -490,17 +480,36 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
   // This is the hash map used for hash-based aggregation. It is backed by an
   // UnsafeFixedWidthAggregationMap and it is used to store
   // all groups and their corresponding aggregation buffers for hash-based aggregation.
-  //private[this]
-  val hashMap = if (aggregateStore == null) new UnsafeFixedWidthMonotonicAggregationMap(
-    initialAggregationBuffer,
-    StructType.fromAttributes(allAggregateFunctions.flatMap(_.aggBufferAttributes)),
-    StructType.fromAttributes(groupingExpressions.map(_.toAttribute)),
-    1024 * 16, // initial capacity
-    TaskContext.get().taskMemoryManager().pageSizeBytes,
-    false // disable tracking of performance metrics
-  ) else {
-    aggregateStore.setInitialAggregationBuffer(initialAggregationBuffer)
-    aggregateStore
+  val hashMap = if (!isMSum) {
+    if (aggregateStore == null) new UnsafeFixedWidthMinMaxMonotonicAggregationMap(
+      initialAggregationBuffer,
+      StructType.fromAttributes(allAggregateFunctions.flatMap(_.aggBufferAttributes)),
+      StructType.fromAttributes(groupingExpressions.map(_.toAttribute)),
+      1024 * 16, // initial capacity
+      TaskContext.get().taskMemoryManager().pageSizeBytes,
+      false // disable tracking of performance metrics
+    ) else {
+      val store = aggregateStore.asInstanceOf[UnsafeFixedWidthMinMaxMonotonicAggregationMap]
+      store.setInitialAggregationBuffer(initialAggregationBuffer)
+      store
+    }
+  } else {
+    if (aggregateStore == null) new UnsafeFixedWidthSumMinMaxMonotonicAggregationMap(
+      initialAggregationBuffer,
+      StructType.fromAttributes(allAggregateFunctions.flatMap(_.aggBufferAttributes)),
+      initialSubAggregationBuffer,
+      StructType.fromAttributes(allAggregateFunctions.flatMap(_.aggBufferAttributes)),
+      StructType.fromAttributes(groupingExpressions.map(_.toAttribute)),
+      StructType.fromAttributes(subGroupingExpressions.map(_.toAttribute)),
+      1024 * 16, // initial capacity
+      TaskContext.get().taskMemoryManager().pageSizeBytes,
+      false // disable tracking of performance metrics
+    ) else {
+      val store = aggregateStore.asInstanceOf[UnsafeFixedWidthSumMinMaxMonotonicAggregationMap]
+      store.setInitialAggregationBuffer(initialAggregationBuffer)
+      store.setInitialSubAggregationBuffer(initialSubAggregationBuffer)
+      store
+    }
   }
 
   // The function used to read and process input rows. When processing input rows,
@@ -509,6 +518,15 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
   // after each becomes full then using sort to merge these spills, finally do sort
   // based aggregation.
   def processInputs(fallbackStartsAt: Int): JavaHashMap[UnsafeRow, UnsafeRow] = {
+    isMSum match {
+      case true =>
+        processInputsSum(fallbackStartsAt)
+      case false =>
+        processInputsMinMax(fallbackStartsAt)
+    }
+  }
+
+  def processInputsMinMax(fallbackStartsAt: Int): JavaHashMap[UnsafeRow, UnsafeRow] = {
     val deltaSet = new JavaHashMap[UnsafeRow, UnsafeRow]()
     if (groupingExpressions.isEmpty) {
       // If there is no grouping expressions, we can just reuse the same buffer over and over again.
@@ -533,10 +551,12 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
         if (i < fallbackStartsAt) {
           buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
         }
+
         if (buffer == null) {
           // failed to allocate the first page
           throw new OutOfMemoryError("No enough memory for aggregation")
         }
+
         // APS - to reduce object creation only copy() on the first item
         if (i == 0)
           before = buffer.copy()
@@ -544,10 +564,106 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
           before.copyFrom(buffer)
 
         processRow(buffer, newInput)
+
+        //println(s"${Utils.printRow(groupingKey, groupProjectionAttributes.map(_.toAttribute.dataType))}" +
+        //  s",${Utils.printRow(buffer, allAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType))}")
         // APS - if the value has been updated, record the tuple changed in the deltaSet
-        // TODO - use optimized hashmap - these copy()s create alot of objects
-        if (!before.equals(buffer))
+        // TODO - use optimized map - these copy()s create alot of objects
+        if (!before.equals(buffer)) {
           deltaSet.put(groupingKey.copy(), buffer.copy())
+        }
+
+        i += 1
+      }
+    }
+
+    // if we have duplicates due to the MSum requirement that we capture X,Y,Z for a D even though we're using MMAX
+    val distinctGroupingExpressions = groupingExpressions.toSet
+    if (distinctGroupingExpressions.size == groupingExpressions.size)
+      deltaSet
+    else {
+      // TODO - optimize the plan generated - this paring down is suboptimal
+      logInfo(s"paring down keys of deltaSet from ${groupingExpressions.mkString(",")} to ${distinctGroupingExpressions.mkString(",")}")
+      // pare down the keys from the deltaSet to produce a newDeltaSet
+      val distinctProjection = UnsafeProjection.create(distinctGroupingExpressions.toSeq, groupingExpressions.map(_.toAttribute))
+
+      val newDeltaSet = new JavaHashMap[UnsafeRow, UnsafeRow](deltaSet.size())
+      for (entry <- deltaSet.entrySet().asScala) {
+        val value = entry.getValue
+        val newKey = distinctProjection.apply(entry.getKey)
+        newDeltaSet.put(newKey.copy(), value.copy())
+      }
+      newDeltaSet
+    }
+  }
+
+  def processInputsSum(fallbackStartsAt: Int): JavaHashMap[UnsafeRow, UnsafeRow] = {
+    val deltaSet = new JavaHashMap[UnsafeRow, UnsafeRow]()
+    if (groupingExpressions.isEmpty) {
+      // If there is no grouping expressions, we can just reuse the same buffer over and over again.
+      // Note that it would be better to eliminate the hash map entirely in the future.
+      val groupingKey = groupProjection.apply(null)
+      val buffer: UnsafeRow = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+      while (inputIter.hasNext) {
+        val newInput = inputIter.next()
+        numInputRows += 1
+        processRow(buffer, newInput)
+        deltaSet.put(groupingKey.copy(), buffer.copy())
+      }
+    } else {
+      // create an UnsafeRow to store the previous buffer to see if it changed after evaluation
+      var beforeSubKeyBuffer = new UnsafeRow()
+
+      var i = 0
+      while (inputIter.hasNext) {
+        val newInput = inputIter.next()
+        numInputRows += 1
+        val groupingKey = groupProjection.apply(newInput)
+        val subGroupingKey = subGroupProjection.apply(newInput)
+
+        //logInfo(s"grouping key: ${Utils.printRow(groupingKey, groupProjectionAttributes.map(_.toAttribute.dataType))}" +
+        //  s",subgrouping key: ${Utils.printRow(subGroupingKey, subGroupProjectionAttributes.map(_.toAttribute.dataType))}")
+
+        var buffer: UnsafeRow = null
+        var subKeyBuffer: UnsafeRow = null
+        if (i < fallbackStartsAt) {
+          buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+          subKeyBuffer = hashMap.asInstanceOf[UnsafeFixedWidthSumMinMaxMonotonicAggregationMap].getAggregationSubKeyBufferFromUnsafeRow(subGroupingKey)
+        }
+
+        if (buffer == null || subKeyBuffer == null) {
+          // failed to allocate the first page
+          throw new OutOfMemoryError("No enough memory for aggregation")
+        }
+
+        // APS - to reduce object creation only copy() on the first item
+        if (i == 0)
+          beforeSubKeyBuffer = subKeyBuffer.copy()
+        else
+          beforeSubKeyBuffer.copyFrom(subKeyBuffer)
+
+        processRow(subKeyBuffer, newInput)
+
+        //logInfo(s"subKeyBuffer before: ${Utils.printRow(beforeSubKeyBuffer, allSubAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType))} " +
+        //  s"after: ${Utils.printRow(subKeyBuffer, allSubAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType))}")
+
+        // TODO - use optimized map - these copy()s create alot of objects
+        if (!beforeSubKeyBuffer.equals(subKeyBuffer)) {
+          val beforeBuffer = buffer.copy()
+
+          processDelta(beforeSubKeyBuffer, subKeyBuffer)
+
+          // we have a change in a subkey, so we can update the running sum and record the change in the delta-set
+          // deltaBuffer contains the values D' to add to N
+          // processRowDelta sets buffer to N + D'
+          applyDelta(buffer, deltaBuffer)
+
+          //val deltaDataTypes = allSubAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType)
+          //logInfo(s"buffer before: ${Utils.printRow(beforeBuffer, allAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType))} " +
+          //  s"after: ${Utils.printRow(buffer, allAggregateFunctions.flatMap(_.aggBufferAttributes).map(_.dataType))} " +
+          //  s"deltas: ${Utils.printRow(deltaBuffer, deltaDataTypes)}")
+          deltaSet.put(groupingKey.copy(), buffer.copy())
+        }
 
         i += 1
       }
@@ -557,11 +673,9 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
 
   // The iterator created from hashMap. It is used to generate output rows when we
   // are using hash-based aggregation.
-  //private[this]
   var aggregationBufferMapIterator: KVIterator[UnsafeRow, UnsafeRow] = null
 
   // Indicates if aggregationBufferMapIterator still has key-value pairs.
-  //private[this]
   var mapIteratorHasNext: Boolean = false
 
   ///////////////////////////////////////////////////////////////////////////
@@ -570,13 +684,11 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
 
   // This sorter is used for sort-based aggregation. It is initialized as soon as
   // we switch from hash-based to sort-based aggregation. Otherwise, it is not used.
-  //private[this]
   var externalSorter: UnsafeKVExternalSorter = null
 
   /**
     * Switch to sort-based aggregation when the hash-based approach is unable to acquire memory.
     */
-  //private
   def switchToSortBasedAggregation(): Unit = {
     logInfo("falling back to sort based aggregation.")
 
@@ -597,7 +709,9 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
       allAggregateFunctions.flatMap(_.inputAggBufferAttributes)
 
     // Set up new processRow and generateOutput.
-    processRow = generateProcessRow(newInputAttributes)
+    processRow = if (isMSum) generateProcessRow2(newInputAttributes) else
+      generateProcessRow(newInputAttributes)
+
     generateOutput = generateResultProjection()
 
     // Step 5: Get the sorted iterator from the externalSorter.
@@ -707,10 +821,6 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
     aggregationBufferMapIterator = hashMap.iterator()
     // Pre-load the first key-value pair from the aggregationBufferMapIterator.
     mapIteratorHasNext = aggregationBufferMapIterator.next()
-    // APS - Do not free this map - its used throughout the recursion
-    /*if (!mapIteratorHasNext) {
-      hashMap.free()
-    }*/
   }
 
   ///////////////////////////////////////////////////////////////////////////
@@ -797,7 +907,9 @@ class TungstenMonotonicAggregationIterator(groupingExpressions: Seq[NamedExpress
 
 // Special iterator wrapper to convert key values into rows
 case class KeyValueToInternalRowIterator(iter: KVIterator[UnsafeRow, UnsafeRow],
-                                         generateOutput: (UnsafeRow, UnsafeRow) => UnsafeRow) extends Iterator[InternalRow] {
+                                         generateOutput: (UnsafeRow, UnsafeRow) => UnsafeRow,
+                                         schema: Seq[DataType])
+  extends Iterator[InternalRow] with Logging {
 
   var kvIteratorHasNext = iter.next()
 
@@ -808,6 +920,7 @@ case class KeyValueToInternalRowIterator(iter: KVIterator[UnsafeRow, UnsafeRow],
   override def next(): InternalRow = {
     val result = generateOutput(iter.getKey, iter.getValue)
     kvIteratorHasNext = iter.next()
+    //logInfo(s"${Utils.printRow(result, schema)}")
     result
   }
 }

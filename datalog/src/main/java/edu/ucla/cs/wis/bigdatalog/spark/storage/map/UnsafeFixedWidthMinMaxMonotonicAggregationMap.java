@@ -23,6 +23,7 @@ import java.io.ObjectInput;
 import java.io.ObjectOutput;
 import java.util.Iterator;
 
+import edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates.AggregateStore;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkEnv;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -36,38 +37,38 @@ import org.apache.spark.unsafe.memory.MemoryLocation;
 import scala.reflect.ClassTag$;
 
 /**
- * Unsafe-based HashMap for performing aggregations where the aggregated values are fixed-width.
+ * Unsafe-based HashMap for performing monotonic aggregations with MMIN/MMAX where the aggregated values are fixed-width.
  *
  * This map supports a maximum of 2 billion keys.
  */
-public final class UnsafeFixedWidthMonotonicAggregationMap implements Externalizable {
+public class UnsafeFixedWidthMinMaxMonotonicAggregationMap implements Externalizable, AggregateStore {
 
     /**
      * An empty aggregation buffer, encoded in UnsafeRow format. When inserting a new key into the
      * map, we copy this buffer and use it as the value.
      */
-    private byte[] emptyAggregationBuffer;
+    protected byte[] emptyAggregationBuffer;
 
-    private StructType aggregationBufferSchema;
+    protected StructType aggregationBufferSchema;
 
-    private StructType groupingKeySchema;
+    protected StructType groupingKeySchema;
 
     /**
      * Encodes grouping keys as UnsafeRows.
      */
-    private UnsafeProjection groupingKeyProjection;
+    protected UnsafeProjection groupingKeyProjection;
 
     /**
      * A hashmap which maps from opaque bytearray keys to bytearray values.
      */
-    private edu.ucla.cs.wis.bigdatalog.spark.storage.map.BytesToBytesMap map;
+    protected edu.ucla.cs.wis.bigdatalog.spark.storage.map.BytesToBytesMap map;
 
     /**
      * Re-used pointer to the current aggregation buffer
      */
-    private UnsafeRow currentAggregationBuffer = new UnsafeRow();
+    protected UnsafeRow currentAggregationBuffer = new UnsafeRow();
 
-    private boolean enablePerfMetrics;
+    protected boolean enablePerfMetrics;
 
     /**
      * Create a new UnsafeFixedWidthAggregationMap.
@@ -79,27 +80,24 @@ public final class UnsafeFixedWidthMonotonicAggregationMap implements Externaliz
      * @param pageSizeBytes           the data page size, in bytes; limits the maximum record size.
      * @param enablePerfMetrics       if true, performance metrics will be recorded (has minor perf impact)
      */
-    public UnsafeFixedWidthMonotonicAggregationMap(
+    public UnsafeFixedWidthMinMaxMonotonicAggregationMap(
             InternalRow emptyAggregationBuffer,
             StructType aggregationBufferSchema,
             StructType groupingKeySchema,
             int initialCapacity,
             long pageSizeBytes,
             boolean enablePerfMetrics) {
-        this.aggregationBufferSchema = aggregationBufferSchema;
         this.groupingKeyProjection = UnsafeProjection.create(groupingKeySchema);
         this.groupingKeySchema = groupingKeySchema;
-        this.map =
-                new edu.ucla.cs.wis.bigdatalog.spark.storage.map.BytesToBytesMap(initialCapacity, pageSizeBytes, enablePerfMetrics);
+        this.map = new edu.ucla.cs.wis.bigdatalog.spark.storage.map.BytesToBytesMap(initialCapacity, pageSizeBytes, enablePerfMetrics);
         this.enablePerfMetrics = enablePerfMetrics;
 
-        setInitialAggregationBuffer(emptyAggregationBuffer);
+        this.aggregationBufferSchema = aggregationBufferSchema;
 
-        //final UnsafeProjection valueProjection = UnsafeProjection.create(aggregationBufferSchema);
-        //this.emptyAggregationBuffer = valueProjection.apply(emptyAggregationBuffer).getBytes();
+        setInitialAggregationBuffer(emptyAggregationBuffer);
     }
 
-    public UnsafeFixedWidthMonotonicAggregationMap() { /* For Serialization */ }
+    public UnsafeFixedWidthMinMaxMonotonicAggregationMap() { /* For Serialization */ }
 
     public void setInitialAggregationBuffer(InternalRow emptyAggregationBuffer) {
         // Initialize the buffer for aggregation value
@@ -225,7 +223,7 @@ public final class UnsafeFixedWidthMonotonicAggregationMap implements Externaliz
     }*/
 
     public void readExternal(ObjectInput in) throws java.io.IOException {
-        long start = System.currentTimeMillis();
+        //long start = System.currentTimeMillis();
         int nKeys = in.readInt();
         int initialCapacity = nKeys;
         if (initialCapacity == 0)
@@ -288,7 +286,7 @@ public final class UnsafeFixedWidthMonotonicAggregationMap implements Externaliz
     }
 
     public void writeExternal(ObjectOutput out) throws java.io.IOException {
-        long start = System.currentTimeMillis();
+        //long start = System.currentTimeMillis();
         // write out the map to byte array
         out.writeInt(map.numElements());
         if (enablePerfMetrics)

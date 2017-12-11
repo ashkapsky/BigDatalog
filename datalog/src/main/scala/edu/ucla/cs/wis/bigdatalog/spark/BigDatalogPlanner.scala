@@ -18,10 +18,10 @@
 package edu.ucla.cs.wis.bigdatalog.spark
 
 import edu.ucla.cs.wis.bigdatalog.spark.execution.ShuffleHashJoin
-import edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates.{MonotonicAggregate, MonotonicAggregatePartial}
+import edu.ucla.cs.wis.bigdatalog.spark.execution.aggregates.{MSum, MonotonicAggregate, MonotonicAggregatePartial}
 import edu.ucla.cs.wis.bigdatalog.spark.logical.CacheHint
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Expression, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Expression, NamedExpression}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.{Strategy, _}
@@ -50,6 +50,9 @@ class BigDatalogPlanner(val bigDatalogContext: BigDatalogContext)
         execution.recursion.AggregateRecursion(name, output, planLater(left), planLater(right), partitioning) :: Nil
       case logical.AggregateRelation(name, output, partitioning) =>
         execution.AggregateRelation(name, output, partitioning) :: Nil
+      case logical.MutualAggregateRecursion(name, isLinear, left, right, partitioning) =>
+        val planLeft = if (left == null) null else planLater(left)
+        execution.recursion.MutualAggregateRecursion(name, isLinear, planLeft, planLater(right), partitioning) :: Nil
       case _ => Nil
     }
   }
@@ -171,19 +174,29 @@ class BigDatalogPlanner(val bigDatalogContext: BigDatalogContext)
                              resultExpressions: Seq[NamedExpression],
                              partitioning: Seq[Int],
                              child: SparkPlan): Seq[SparkPlan] = {
-    // 1. Create an Aggregate Operator for partial aggregations.
 
+    val isMSum = aggregateExpressions.exists(_.aggregateFunction.isInstanceOf[MSum])
+
+    val subGroupingExpressions = if (isMSum) aggregateExpressions.map(_.aggregateFunction)
+      .collect { case msum: MSum => msum.subGroupingKey.asInstanceOf[NamedExpression] } else Nil
+
+    // 1. Create an Aggregate Operator for partial aggregations.
     val groupingAttributes = groupingExpressions.map(_.toAttribute)
-    val partialAggregateExpressions = aggregateExpressions.map(_.copy(mode = Partial))
-    val partialAggregateAttributes =
-      partialAggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
-    val partialResultExpressions =
-      groupingAttributes ++
-        partialAggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
+    val partialAggregateExpressions = if (isMSum) {
+      aggregateExpressions.map(ae => {
+        val aggregateFunction = Max(ae.aggregateFunction.children(0))
+        AggregateExpression(aggregateFunction, Partial, ae.isDistinct)
+      })
+    } else aggregateExpressions.map(_.copy(mode = Partial))
+
+    val partialGroupingExpressions = groupingExpressions ++ subGroupingExpressions
+    val partialAggregateAttributes = partialAggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
+    val partialResultExpressionsAggregateComponent = partialAggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
+    val partialResultExpressions = partialGroupingExpressions ++ partialResultExpressionsAggregateComponent
 
     val partialAggregate = new MonotonicAggregatePartial(
       requiredChildDistributionExpressions = None: Option[Seq[Expression]],
-      groupingExpressions = groupingExpressions,
+      groupingExpressions = partialGroupingExpressions,
       nonCompleteAggregateExpressions = partialAggregateExpressions,
       nonCompleteAggregateAttributes = partialAggregateAttributes,
       completeAggregateExpressions = Nil,
@@ -192,25 +205,46 @@ class BigDatalogPlanner(val bigDatalogContext: BigDatalogContext)
       resultExpressions = partialResultExpressions,
       child = child)
 
+    /*val msg = new StringBuilder()
+    msg.append(s"subGroupingExpressions: ${subGroupingExpressions}\n")
+    msg.append(s"groupingAttributes: ${groupingAttributes}\n")
+    msg.append(s"partialAggregateExpressions: ${partialAggregateExpressions}\n")
+    msg.append(s"partialAggregateExpressions.inputAggBufferAttributes: ${partialAggregateExpressions.map(_.aggregateFunction.inputAggBufferAttributes)}\n")
+    msg.append(s"partialAggregateAttributes: ${partialAggregateAttributes}\n")
+    msg.append(s"partialResultExpressions: ${partialResultExpressions}\n")*/
+
     // 2. Create an Aggregate Operator for final aggregations.
     val finalAggregateExpressions = aggregateExpressions.map(_.copy(mode = Final))
-    // The attributes of the final aggregation buffer, which is presented as input to the result
-    // projection:
-    val finalAggregateAttributes = finalAggregateExpressions.map {
-      expr => aggregateFunctionToAttribute(expr.aggregateFunction, expr.isDistinct)
-    }
 
+    // initialize aggregate buffers and connect msum with max
+    finalAggregateExpressions.map(_.aggregateFunction)
+      .zip(partialResultExpressionsAggregateComponent)
+      .collect { case (msum: MSum, ar: AttributeReference) => {
+        msum.inputAggBufferAttributes
+        msum.max = ar
+      }}
+
+    // The attributes of the final aggregation buffer, which is presented as input to the result projection:
+    val finalAggregateAttributes = finalAggregateExpressions.map { expr => aggregateFunctionToAttribute(expr.aggregateFunction, expr.isDistinct) }
+
+    /*msg.append(s"finalGroupingAttributes: ${groupingAttributes}\n")
+    msg.append(s"finalAggregateExpressions: ${finalAggregateExpressions}\n")
+    msg.append(s"finalAggregateExpressions.inputAggBufferAttributes: ${finalAggregateExpressions.map(_.aggregateFunction.inputAggBufferAttributes)}\n")
+    msg.append(s"finalAggregateAttributes: ${finalAggregateAttributes}\n")
+    println(msg)*/
+
+    // lastly add the outer MonotonicAggregate
     val finalAggregate = new MonotonicAggregate(
-      requiredChildDistributionExpressions = Some(groupingAttributes),
-      groupingExpressions = groupingAttributes,
-      nonCompleteAggregateExpressions = finalAggregateExpressions,
-      nonCompleteAggregateAttributes = finalAggregateAttributes,
-      completeAggregateExpressions = Nil,
-      completeAggregateAttributes = Nil,
-      initialInputBufferOffset = groupingExpressions.length,
-      resultExpressions = resultExpressions,
-      partitioning = partitioning,
-      child = partialAggregate)
+        requiredChildDistributionExpressions = Some(groupingAttributes),
+        groupingExpressions = groupingAttributes,
+        nonCompleteAggregateExpressions = finalAggregateExpressions,
+        nonCompleteAggregateAttributes = finalAggregateAttributes,
+        completeAggregateExpressions = Nil,
+        completeAggregateAttributes = Nil,
+        initialInputBufferOffset = groupingExpressions.length,
+        resultExpressions = resultExpressions,
+        partitioning = partitioning,
+        child = partialAggregate)
 
     finalAggregate :: Nil
   }
